@@ -1,0 +1,18 @@
+[project]
+name = "content-pipeline"
+version = "0.1.0"
+description = "Tools for converting and processing content."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "google-genai>=1.52.0",
+    "pypdf>=6.4.0",
+]
+
+[project.scripts]
+gemini-md = "content_pipeline.gemini_md:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
