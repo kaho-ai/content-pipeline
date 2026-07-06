@@ -37,6 +37,17 @@ def split_pdf(input_file: Path, chunk_size: int, tmp_dir: Path) -> list[Path]:
     return chunk_paths
 
 
+def extract_pdf_page(input_file: Path, reader: pypdf.PdfReader, page_number: int, tmp_dir: Path) -> Path:
+    """Write a single 1-based PDF page to a temporary PDF."""
+    writer = pypdf.PdfWriter()
+    writer.add_page(reader.pages[page_number - 1])
+
+    page_path = tmp_dir / f"{input_file.stem}_page_{page_number:04d}.pdf"
+    with page_path.open("wb") as f:
+        writer.write(f)
+    return page_path
+
+
 def convert_chunk(
     client: genai.Client,
     chunk_path: Path,
@@ -104,6 +115,7 @@ def convert_pdf(
     client: genai.Client,
     chunk_size: int = CHUNK_SIZE,
     model: str = DEFAULT_MODEL,
+    page_number: int | None = None,
 ) -> Path:
     """Split a large PDF, convert each chunk, concatenate the results, and write Markdown."""
     if not input_file.exists():
@@ -119,7 +131,15 @@ def convert_pdf(
     total_pages = len(reader.pages)
     print(f"  Total pages: {total_pages}")
 
-    if total_pages <= chunk_size:
+    if page_number is not None:
+        if page_number > total_pages:
+            raise ValueError(f"Page {page_number} is out of range for a {total_pages}-page PDF.")
+
+        print(f"  Single-page mode - converting page {page_number}...")
+        with tempfile.TemporaryDirectory() as tmp_name:
+            page_path = extract_pdf_page(input_file, reader, page_number, Path(tmp_name))
+            md_text = convert_chunk(client, page_path, 0, 1, model)
+    elif total_pages <= chunk_size:
         print("  Small file - converting directly...")
         md_text = convert_chunk(client, input_file, 0, 1, model)
     else:
@@ -144,7 +164,8 @@ def convert_pdf(
             md_text = "\n\n".join(md_parts)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"{input_file.stem}.md"
+    output_stem = f"{input_file.stem}_page_{page_number}" if page_number is not None else input_file.stem
+    output_file = output_dir / f"{output_stem}.md"
     output_file.write_text(md_text, encoding="utf-8")
 
     print(f"  Success! Markdown saved to '{output_file}'")
@@ -175,6 +196,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Pages per Gemini request for large PDFs. Defaults to {CHUNK_SIZE}.",
     )
     parser.add_argument(
+        "--page",
+        type=positive_int,
+        help="Convert only this 1-based page number instead of the entire PDF.",
+    )
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=f"Gemini model to use. Defaults to {DEFAULT_MODEL}.",
@@ -195,6 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 client=client,
                 chunk_size=args.chunk_size,
                 model=args.model,
+                page_number=args.page,
             )
         except Exception as exc:
             failures += 1
