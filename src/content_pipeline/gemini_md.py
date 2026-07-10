@@ -10,7 +10,7 @@ from typing import Sequence
 import pypdf
 from google import genai
 
-CHUNK_SIZE = 20  # pages per chunk
+CHUNK_SIZE = 5  # pages per chunk
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 10  # seconds
 DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
@@ -230,6 +230,9 @@ def convert_pdf(
 
             md_parts = []
             for i, chunk_path in enumerate(chunk_paths):
+                if i > 0:
+                    print("  Sleeping for 5 seconds between requests...")
+                    time.sleep(5)
                 try:
                     md = convert_chunk(client, chunk_path, i, len(chunk_paths), model)
                     md_parts.append(md)
