@@ -180,11 +180,9 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 **7. Paratextual Elements: What to Keep, What to Remove (Strict):** 
 **Delete** running headers (repeated book or chapter titles printed at the top of a page) and printing marks. 
 **Delete** catchwords (the first word of the next page repeated at the bottom of the current one). 
+**Delete** page numbers. Join the text before and after it. Preserve appropriate spacing and punctuation. Do not leave an abrupt break.
 
-**Keep page and poem numbers --- do not delete them.** -> Mark every page number using this exact decorative template, regardless of how plain or elaborate that specific page's own print styling looks: `<!-- page : 1 -->` --- replace 1 with the actual page number, in whichever numeral system it's actually printed in (Arabic or Devanagari; don't convert one to the other). Use this same template consistently for every page in the document. Do not simplify it to a bare number, a short dash pair, or any other shorter style, and do not invent a different decorative style even if the scanned page's own flourish looks different --- this is a normalized marker for the converted document, not a literal transcription of each page's individual print ornament. This includes page numbers that appear in editorial brackets in the source (e.g., [१०]): still normalize them to the template above. A page-number marker will often fall in the middle of a verse, simply because the physical page break happens to land inside a line. When that happens: extract the marker so it doesn't fracture the verse text, rejoin the verse's two halves per Rule 4 as if the break had never happened, and place the page-number marker on its own line at the nearest stanza boundary (immediately before or after, whichever is closer). 
-
-**Don't confuse page numbers with verse numbers.**
-A page number is a standalone marker disconnected from any specific verse, simply counting pages in sequence; a verse number (e.g., "॥ २ ॥") sits directly against the verse it closes, counting compositions, not pages. Keep both, but keep them visually distinct: page numbers use the template above on their own line at a stanza boundary; verse numbers stay attached to the verse they close, unchanged.
+**A page number is a standalone marker disconnected from any specific verse, simply counting pages in sequence; a verse number (e.g., "॥ २ ॥") sits directly against the verse it closes, counting compositions, not pages. Keep both, but keep them visually distinct: page numbers use the template above on their own line at a stanza boundary; verse numbers stay attached to the verse they close, unchanged.**
 
 **8. Titles, Subheadings, and Invocations (मंगलाचरण):** - Main book title → # (H1). - Section/Ramayana-type chapters (काण्ड) or major divisions → ## (H2). - A named composition that opens a genuinely distinct section --- a titled hymn, a labelled sub-episode, or the first shift into a new grouping --- → ### (H3). Do NOT give every individual दोहा, सोरठा, or चौपाई its own H3 as it recurs through a continuous passage; a single kand-length section can contain hundreds of each, and heading every one defeats the purpose of a heading hierarchy. Where you still want to flag the type of a recurring verse without a full heading, use a small inline label instead, e.g. 
 **(दोहा)**. - Dedications or invocations (e.g., "ॐ","श्री गणेशाय नमः") keep as standalone italic lines using *...*. 
@@ -194,31 +192,14 @@ A page number is a standalone marker disconnected from any specific verse, simpl
 
 **10. Tables of Contents (अनुक्रमणिका):** If present, convert to a nested Markdown unordered list (- ), preserving indentation levels. Since page numbers are now preserved as markers throughout the body (Rule 6), keep the TOC's page-number references too --- they correspond to real, findable points in the converted document.
 
-**11. Structural Containers for Pandoc/Typst (Custom Divs):** To enable later styling in pandoc/typst, wrap the content in the following fenced divs as appropriate. These divs do not alter the text; they are purely structural markers for output rendering.
+**11. Mandatory Page‑by‑Page Processing (No Skipping):** Process every page of the source strictly in order. Do **not** skip, condense, merge, or silently omit any page, even if it seems repetitive, damaged, or hard to read. Transcribe what is legible; for entirely illegible portions, insert a bracketed note such as `[अस्पष्ट]` or `[पृष्ठ X – पूर्णतः अस्पष्ट]` and continue to the next page. If a page is blank, output only the page‑number marker (Rule 6) and a line `[रिक्त पृष्ठ]`. At the end of your conversion, verify that the sequence of page markers is continuous and includes every page from the first to the last; if any marker is missing, re‑examine your output.
 
--   **`::: poem`** -- Use for any metrical composition: dohas, chaupais, sorthas, songs, shlokas (whether vernacular or Sanskrit), ghazals, and all verse. Wrap a **continuous block of verse** (without prose interruption) in this div. If a major section (e.g., a काण्ड) consists entirely of verse, wrap the entire section in one `::: poem` div; if there are prose commentaries or interspersed passages, wrap each separate verse passage individually. The div should start at the beginning of the verse block (after any heading or invocation) and close at the end of that verse block, before a heading or prose section. Do **not** wrap individual lines or single dohas unless they stand alone as a self‑contained poem.
-
--   **`::: quote`** -- Use for long quotations or extracted passages that are **not** in verse---e.g., a prose excerpt from another text, a cited passage, or a block of dialogue that is clearly borrowed.
-
--   **`::: letter`** -- Use if the text is explicitly a letter (e.g., begins with a salutation and ends with a signature). Do not use for poetic epistles that are already in verse (they go under `::: poem`).
-
--   **`::: preface`** -- Use for the author's preface, introduction, foreword, or any front matter that is not part of the main narrative. This includes editorial introductions if they are part of the scanned source.
-
--   **`::: footnote`** -- Use for lengthy editorial notes or appendixed remarks that are not linked via superscript numbers in the main text. (Normal scholarly footnotes with markers should still be handled as per Rule 8.) This div is rarely needed; use it only when you encounter a distinct section labelled as "footnote" or "टिप्पणी" that stands apart from the verse.
-
--   **`::: appendix`** -- Use for any material clearly designated as an appendix, such as supplementary tables, glossaries, or extra chapters outside the main sequence.
-
-**Placement and nesting**: These divs should enclose entire logical sections. Page‑number markers (Rule 6) must remain **outside** the divs, as they are navigational aids and not part of the original content. Do not nest a div inside another div of the same type; if two verse blocks are separated by prose, close the first `::: poem` before the prose and reopen after it. Always close each div with `:::` on its own line. The div syntax follows pandoc's fenced div format.
-
-**12. Mandatory Page‑by‑Page Processing (No Skipping):** Process every page of the source strictly in order. Do **not** skip, condense, merge, or silently omit any page, even if it seems repetitive, damaged, or hard to read. Transcribe what is legible; for entirely illegible portions, insert a bracketed note such as `[अस्पष्ट]` or `[पृष्ठ X – पूर्णतः अस्पष्ट]` and continue to the next page. If a page is blank, output only the page‑number marker (Rule 6) and a line `[रिक्त पृष्ठ]`. At the end of your conversion, verify that the sequence of page markers is continuous and includes every page from the first to the last; if any marker is missing, re‑examine your output.
-
-**Output Format:** Return your entire response inside a single, clean fenced Markdown code block. Open and close the wrapper with four backtick characters together --- one more than the usual three --- immediately followed by the word markdown on the opening line. This way, if the source document happens to contain its own triple-backtick block for any reason, that inner fence can't prematurely close your outer wrapper.
-
-Markdown nohighlight, # This stays a code block but Tree-sitter highlighting is skipped.
-
-Process every page of the source, strictly in order. Do not skip, condense, merge, or silently omit any page, even one that seems repetitive, damaged, or hard to read --- transcribe what is legible and mark an unclear portion with something like [अस्पष्ट] rather than dropping the page.
-
-Do not include any explanatory text, summaries, romanization, or feedback outside this code block. Begin directly with the converted content, and contain nothing inside the block except the converted text itself --- no commentary on the conversion process, no sentence noting that a section or page range is complete, and no note or guess about where a future response should resume. If the document is too long to finish in a single response, simply stop at the end of a poem or kand --- a clean structural boundary, never mid-verse --- and close the fence there. The last page-number marker already present in your own output is the resumption point; do not restate or re-estimate it in prose, since that kind of self-generated guess is redundant at best and has already produced an incorrect page number once."
+**Output Format:** 
+- Return your entire response inside a single, clean fenced Markdown code block. 
+- Open and close the wrapper with four backtick characters together --- one more than the usual three --- immediately followed by the word markdown on the opening line. This way, if the source document happens to contain its own triple-backtick block for any reason, that inner fence can't prematurely close your outer wrapper.
+- Markdown nohighlight, # This stays a code block but Tree-sitter highlighting is skipped.
+- Process every page of the source, strictly in order. Do not skip, condense, merge, or silently omit any page, even one that seems repetitive, damaged, or hard to read --- transcribe what is legible and mark an unclear portion with something like [अस्पष्ट] rather than dropping the page.
+- Do not include any explanatory text, summaries, romanization, or feedback outside this code block. Begin directly with the converted content, and contain nothing inside the block except the converted text itself --- no commentary on the conversion process, no sentence noting that a section or page range is complete, and no note or guess about where a future response should resume. If the document is too long to finish in a single response, simply stop at the end of a poem or kand --- a clean structural boundary, never mid-verse --- and close the fence there. The last page-number marker already present in your own output is the resumption point; do not restate or re-estimate it in prose, since that kind of self-generated guess is redundant at best and has already produced an incorrect page number once."
 """
     uploaded_file = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -274,9 +255,10 @@ def convert_pdf(
     client: genai.Client,
     chunk_size: int = CHUNK_SIZE,
     model: str = DEFAULT_MODEL,
-    page_range: tuple[int, int] | None = None, 
+    page_range: tuple[int, int] | None = None,
 ) -> Path:
     """Split a large PDF, convert each chunk, concatenate the results, and write Markdown."""
+
     if not input_file.exists():
         raise FileNotFoundError(f"File '{input_file}' not found.")
     if not input_file.is_file():
@@ -290,97 +272,110 @@ def convert_pdf(
     total_pages = len(reader.pages)
     print(f"  Total pages: {total_pages}")
 
+    temp_dir = None
     working_file = input_file
 
-    if page_range is not None:
-        start_page, end_page = page_range
+    try:
+        # ------------------------------------------------------------
+        # Extract page range if requested
+        # ------------------------------------------------------------
+        if page_range is not None:
+            start_page, end_page = page_range
 
-        if end_page > total_pages:
-            raise ValueError(
-                f"Page {end_page} exceeds PDF length ({total_pages})."
+            if end_page > total_pages:
+                raise ValueError(
+                    f"Page {end_page} exceeds PDF length ({total_pages})."
+                )
+
+            print(f"  Selecting pages {start_page}-{end_page}...")
+
+            temp_dir = tempfile.TemporaryDirectory()
+
+            working_file = extract_pdf_range(
+                input_file,
+                reader,
+                start_page,
+                end_page,
+                Path(temp_dir.name),
             )
 
-        print(f"  Selecting pages {start_page}-{end_page}...")
+            reader = pypdf.PdfReader(working_file)
+            total_pages = len(reader.pages)
 
-        temp_dir = tempfile.TemporaryDirectory()
+        # ------------------------------------------------------------
+        # Convert
+        # ------------------------------------------------------------
+        if total_pages <= chunk_size:
+            print("  Small file - converting directly...")
+            md_text = convert_chunk(client, working_file, 0, 1, model)
 
-        working_file = extract_pdf_range(
-            input_file,
-            reader,
-            start_page,
-            end_page,
-            Path(temp_dir.name),
-        )
-
-        reader = pypdf.PdfReader(working_file)
-        total_pages = len(reader.pages)
-
-    if total_pages <= chunk_size:
-        print("  Small file - converting directly...")
-        md_text = convert_chunk(client, working_file, 0, 1, model)
-    else:
-        with tempfile.TemporaryDirectory() as tmp_name:
-            tmp_dir = Path(tmp_name)
-
-            chunk_paths = split_pdf(
-                working_file,
-                chunk_size,
-                tmp_dir,
-            )
-
-            md_parts = []
-
-            for i, chunk_path in enumerate(chunk_paths):
-
-                if i > 0:
-                    print("  Sleeping for 3 seconds between requests...")
-                    time.sleep(3)
-
-                try:
-                    md = convert_chunk(
-                        client,
-                        chunk_path,
-                        i,
-                        len(chunk_paths),
-                        model,
-                    )
-
-                    md_parts.append(md)
-
-                except Exception:
-                     print(
-                          f"  Skipping chunk {i + 1} due to repeated failures."
-                         )
-
-                     start = i * chunk_size + 1
-                     end = min((i + 1) * chunk_size, total_pages)
-
-                     md_parts.append(
-                          f"\n\n<!-- CONVERSION FAILED: pages {start}-{end} -->\n\n"
-                            )
-
-            md_text = "\n\n".join(md_parts)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if page_range is None:
-        output_stem = input_file.stem
-    else:
-        start, end = page_range
-
-        if start == end:
-            output_stem = f"{input_file.stem}_page_{start}"
         else:
-            output_stem = f"{input_file.stem}_pages_{start}-{end}"
-    
-    output_file = output_dir / f"{output_stem}.md"
-    output_file.write_text(md_text, encoding="utf-8")
+            with tempfile.TemporaryDirectory() as tmp_name:
+                tmp_dir = Path(tmp_name)
 
-    if temp_dir is not None:
-        temp_dir.cleanup()
+                chunk_paths = split_pdf(
+                    working_file,
+                    chunk_size,
+                    tmp_dir,
+                )
 
-    print(f"  Success! Markdown saved to '{output_file}'")
-    return output_file
+                md_parts = []
+
+                for i, chunk_path in enumerate(chunk_paths):
+
+                    if i > 0:
+                        print("  Sleeping for 3 seconds between requests...")
+                        time.sleep(3)
+
+                    try:
+                        md = convert_chunk(
+                            client,
+                            chunk_path,
+                            i,
+                            len(chunk_paths),
+                            model,
+                        )
+
+                        md_parts.append(md)
+
+                    except Exception:
+                        print(
+                            f"  Skipping chunk {i + 1} due to repeated failures."
+                        )
+
+                        start = i * chunk_size + 1
+                        end = min((i + 1) * chunk_size, total_pages)
+
+                        md_parts.append(
+                            f"\n\n<!-- CONVERSION FAILED: pages {start}-{end} -->\n\n"
+                        )
+
+                md_text = "\n\n".join(md_parts)
+
+        # ------------------------------------------------------------
+        # Output filename
+        # ------------------------------------------------------------
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if page_range is None:
+            output_stem = input_file.stem
+        else:
+            start, end = page_range
+
+            if start == end:
+                output_stem = f"{input_file.stem}_page_{start}"
+            else:
+                output_stem = f"{input_file.stem}_pages_{start}-{end}"
+
+        output_file = output_dir / f"{output_stem}.md"
+        output_file.write_text(md_text, encoding="utf-8")
+
+        print(f"  Success! Markdown saved to '{output_file}'")
+        return output_file
+
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
 def positive_int(value: str) -> int:
     parsed = int(value)
