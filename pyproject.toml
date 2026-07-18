@@ -7,11 +7,13 @@ requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
     "google-genai>=1.52.0",
+    "pymupdf>=1.28.0",
     "pypdf>=6.4.0",
 ]
 
 [project.scripts]
 gemini-md = "content_pipeline.gemini_md:main"
+validate-count = "content_pipeline.validate_count:main"
 
 [build-system]
 requires = ["hatchling"]
