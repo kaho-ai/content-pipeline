@@ -22,12 +22,22 @@ def main():
 
     # Comparison
     difference = md_words - pdf_words
+    missing_words = max(pdf_words - md_words, 0)
     coverage = (md_words / pdf_words * 100) if pdf_words else 0
 
-    print(f"PDF words:      {pdf_words:,}")
-    print(f"Markdown words: {md_words:,}")
-    print(f"Difference:     {difference:+,}")
-    print(f"Coverage:       {coverage:.2f}%")
+    # Validation status
+    if missing_words > 400:
+        status = "REVIEW"
+    else:
+        status = "PASS"
+
+    # Results
+    print(f"PDF words:       {pdf_words:,}")
+    print(f"Markdown words:  {md_words:,}")
+    print(f"Difference:      {difference:+,}")
+    print(f"Missing words:   {missing_words:,}")
+    print(f"Coverage:        {coverage:.2f}%")
+    print(f"Status:          {status}")
 
 
 if __name__ == "__main__":

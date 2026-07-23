@@ -13,7 +13,7 @@ from google import genai
 CHUNK_SIZE = 10  # pages per chunk
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 10  # seconds
-DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 
 def split_pdf(input_file: Path, chunk_size: int, tmp_dir: Path) -> list[Path]:

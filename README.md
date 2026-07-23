@@ -22,7 +22,7 @@ You can also skip the explicit sync step and run commands directly with `uv run`
 
 ## Credentials
 
-The PDF converter uses Gemini through `google-genai`. Set `GEMINI_API_KEY` before running conversions:
+The PDF converter **uses** Gemini through `google-genai`. Set `GEMINI_API_KEY` before running conversions:
 
 ```bash
 export GEMINI_API_KEY="..."
