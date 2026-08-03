@@ -58,6 +58,8 @@ Generated Markdown files are written as `<output-dir>/<pdf-name>.md`. When `--pa
 
 For full-document conversion, large PDFs are processed internally in chunks according to `--chunk-size` (default: `10` pages). The resulting chunks are combined into one Markdown file per input PDF.
 
+Every converted chunk is checked by three focused Gemini validators covering completeness and ordering, transcription fidelity, and Markdown structure. A chunk is accepted only when all three checks pass. If validation finds errors, the tool retries that chunk with the validator feedback appended to the original conversion instructions, using the same five-attempt retry limit as other conversion failures.
+
 ## Validate PDF to Markdown
 
 Use `validate-count` to compare the word count of a source PDF with its converted Markdown file. This provides a quick way to identify potentially missing content after conversion.

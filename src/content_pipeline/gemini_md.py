@@ -89,6 +89,135 @@ def parse_page_range(value: str) -> tuple[int, int]:
     return start, end
 
 
+def _run_validation_check(
+    client: genai.Client,
+    uploaded_file: object,
+    markdown_text: str,
+    model: str,
+    check_name: str,
+    instructions: str,
+) -> list[str]:
+    """Run one focused validation check and return its actionable errors."""
+    validation_prompt = f"""
+You are a focused quality-control reviewer for a PDF-to-Markdown transcription.
+Compare the uploaded source PDF chunk with the candidate Markdown below.
+
+Validation check: {check_name}
+
+{instructions}
+
+Return exactly PASS if this check finds no material errors.
+Otherwise, return only a concise numbered list of specific, actionable errors.
+For every error, identify the source page or nearby text when possible and state
+what the next conversion attempt must correct. Do not rewrite the document.
+
+--- BEGIN CANDIDATE MARKDOWN ---
+{markdown_text}
+--- END CANDIDATE MARKDOWN ---
+"""
+    response = client.models.generate_content(
+        model=model,
+        contents=[uploaded_file, validation_prompt],
+    )
+    result = response.text
+    if not result or not result.strip():
+        raise ValueError(f"Empty response from {check_name} chunk validator")
+
+    result = result.strip()
+    if result.casefold() == "pass":
+        return []
+    return [f"{check_name}: {result}"]
+
+
+def validate_completeness(
+    client: genai.Client,
+    uploaded_file: object,
+    markdown_text: str,
+    model: str,
+) -> list[str]:
+    """Check that source content is present once and in the original order."""
+    return _run_validation_check(
+        client,
+        uploaded_file,
+        markdown_text,
+        model,
+        "Completeness and ordering",
+        """
+Check that every source page is represented in order and that no legible
+passage, stanza, heading, table entry, footnote, or other substantive content
+was skipped, duplicated, condensed, or invented. Ignore running headers,
+catchwords, printing marks, and standalone printed page numbers.
+""",
+    )
+
+
+def validate_transcription_fidelity(
+    client: genai.Client,
+    uploaded_file: object,
+    markdown_text: str,
+    model: str,
+) -> list[str]:
+    """Check transcription accuracy and preservation of historical language."""
+    return _run_validation_check(
+        client,
+        uploaded_file,
+        markdown_text,
+        model,
+        "Transcription and orthographic fidelity",
+        """
+Check the candidate against the source for incorrect, missing, or invented
+words and punctuation. Pay particular attention to Devanagari glyphs, matras,
+conjuncts, Anusvara, Chandrabindu, Visarga, danda punctuation, verse numbers,
+and obvious OCR confusions. Confirm that genuine Braj, Awadhi, Sanskrit, and
+historical spellings were preserved rather than modernized, summarized, or
+translated.
+""",
+    )
+
+
+def validate_markdown_output(
+    client: genai.Client,
+    uploaded_file: object,
+    markdown_text: str,
+    model: str,
+) -> list[str]:
+    """Check Markdown structure and the raw-output contract."""
+    return _run_validation_check(
+        client,
+        uploaded_file,
+        markdown_text,
+        model,
+        "Markdown structure and output contract",
+        """
+Check that the output is raw Markdown without surrounding code fences,
+explanatory commentary, summaries, or completion notes. Confirm that headings,
+lists, footnotes, stanza breaks, emphasis, and relative indentation preserve
+the source structure and follow the conversion requirements.
+""",
+    )
+
+
+def validate_chunk(
+    client: genai.Client,
+    uploaded_file: object,
+    markdown_text: str,
+    model: str,
+) -> list[str]:
+    """Run every focused chunk validator and aggregate their errors."""
+    errors: list[str] = []
+    errors.extend(validate_completeness(client, uploaded_file, markdown_text, model))
+    errors.extend(
+        validate_transcription_fidelity(
+            client,
+            uploaded_file,
+            markdown_text,
+            model,
+        )
+    )
+    errors.extend(validate_markdown_output(client, uploaded_file, markdown_text, model))
+    return errors
+
+
 def convert_chunk(
     client: genai.Client,
     chunk_path: Path,
@@ -96,7 +225,7 @@ def convert_chunk(
     total_chunks: int,
     model: str,
 ) -> str:
-    """Upload a chunk to Gemini, convert it to Markdown, and retry transient failures."""
+    """Convert and validate a chunk, retrying failures with validator feedback."""
     prompt = """
 "You are a Pandit-level digital archivist and Chhandashastra (छंदशास्त्र) scholar specialising in Hindi, Braj, Awadhi, and archaic Khari Boli poetry/prose from OCR-scanned antique PDFs. Your task is to convert the scanned Devanagari text into pristine, structurally perfect Markdown. DO NOT summarize, modernize, or translate the poetry into English or modern Hindi.
 
@@ -200,6 +329,7 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 - Do not include any explanatory text, summaries, romanization, or feedback. Begin directly with the converted content, and return nothing except the converted text itself --- no commentary on the conversion process, no sentence noting that a section or page range is complete, and no note or guess about where a future response should resume. If the document is too long to finish in a single response, simply stop at the end of a poem or kand --- a clean structural boundary, never mid-verse. The last page-number marker already present in your own output is the resumption point; do not restate or re-estimate it in prose, since that kind of self-generated guess is redundant at best and has already produced an incorrect page number once."
 """
     uploaded_file = None
+    validation_errors: list[str] = []
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if uploaded_file is not None:
@@ -210,21 +340,53 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 
             uploaded_file = client.files.upload(file=chunk_path)
 
+            conversion_contents = [uploaded_file, prompt]
+            if validation_errors:
+                formatted_errors = "\n\n".join(
+                    f"{index}. {error}"
+                    for index, error in enumerate(validation_errors, start=1)
+                )
+                conversion_contents.append(
+                    """
+The previous conversion attempt failed validation. Correct every issue below
+while following all original conversion instructions:
+
+"""
+                    + formatted_errors
+                )
+
             response = client.models.generate_content(
                 model=model,
-                contents=[uploaded_file, prompt],
+                contents=conversion_contents,
             )
-
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
 
             text = response.text
             if not text or not text.strip():
                 raise ValueError("Empty response from Gemini")
 
-            print(f"  Chunk {chunk_index + 1}/{total_chunks} converted successfully")
+            current_validation_errors = validate_chunk(
+                client,
+                uploaded_file,
+                text,
+                model,
+            )
+            if current_validation_errors:
+                validation_errors = current_validation_errors
+                raise ValueError(
+                    "Chunk validation failed:\n"
+                    + "\n".join(validation_errors)
+                )
+
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+            uploaded_file = None
+
+            print(
+                f"  Chunk {chunk_index + 1}/{total_chunks} converted "
+                "and validated successfully"
+            )
             return text
 
         except Exception as exc:
