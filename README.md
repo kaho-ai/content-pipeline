@@ -113,7 +113,7 @@ Options:
 | `-o, --output-dir OUTPUT_DIR` | Yes | None | Directory where Markdown files will be written. The directory is created if it does not exist. |
 | `--chunk-size CHUNK_SIZE` | No | `20` | Pages per Gemini request for large PDFs. Must be greater than zero. PDFs with at most this many pages are converted in a single request. |
 | `--pages PAGES` | No | None | Convert a specific page or page range (for example, `3` or `3-15`) instead of the entire PDF. When multiple PDFs are provided, the same page selection is applied to each input. |
-| `--model MODEL` | No | `gemini-3.1-flash-lite-preview` | Gemini model used for conversion. |
+| `--model MODEL` | No | `gemini-3.5-flash-lite` | Gemini model used for conversion. |
 | `-h, --help` | No | None | Show command help and exit. |
 
 Examples:
@@ -122,7 +122,7 @@ Examples:
 uv run gemini-md -o /tmp/markdown /home/dman/Downloads/tinyspec.pdf
 uv run gemini-md --output-dir markdown --chunk-size 10 large-document.pdf
 uv run gemini-md --output-dir markdown --pages 3-15 /home/dman/Downloads/tinyspec.pdf
-uv run gemini-md --output-dir markdown --model gemini-3.1-flash-lite-preview document.pdf
+uv run gemini-md --output-dir markdown --model gemini-3.5-flash-lite document.pdf
 ```
 
 ### `validate-count`
