@@ -33,32 +33,32 @@ export GEMINI_API_KEY="..."
 Convert a PDF to Markdown:
 
 ```bash
-uv run gemini-md --output-dir markdown path/to/document.pdf
+uv run gemini-md --language Hindi --output-dir markdown path/to/document.pdf
 ```
 
 Convert multiple PDFs in one run:
 
 ```bash
-uv run gemini-md --output-dir markdown first.pdf second.pdf third.pdf
+uv run gemini-md --language Hindi --output-dir markdown first.pdf second.pdf third.pdf
 ```
 
 Convert a specific page from a PDF:
 
 ```bash
-uv run gemini-md --output-dir markdown --pages 3 path/to/document.pdf
+uv run gemini-md --language Hindi --output-dir markdown --pages 3 path/to/document.pdf
 ```
 
 Convert a range of pages from a PDF:
 
 ```bash
-uv run gemini-md --output-dir markdown --pages 3-15 path/to/document.pdf
+uv run gemini-md --language Hindi --output-dir markdown --pages 3-15 path/to/document.pdf
 ```
 
 Generated Markdown files are written as `<output-dir>/<pdf-name>.md`. When `--pages` is used, only the selected page or page range is converted. The selected pages are combined into a single Markdown output file rather than being written as separate per-page files.
 
 For full-document conversion, large PDFs are processed internally in chunks according to `--chunk-size` (default: `10` pages). The resulting chunks are combined into one Markdown file per input PDF.
 
-Every converted chunk is checked by three focused Gemini validators covering completeness and ordering, transcription fidelity, and Markdown structure. A chunk is accepted only when all three checks pass. If validation finds errors, the tool retries that chunk with the validator feedback appended to the original conversion instructions, using the same five-attempt retry limit as other conversion failures.
+Every converted chunk is checked for Unicode script consistency with the required `--language`, then by three focused Gemini validators covering completeness and ordering, transcription fidelity, and Markdown structure. Punctuation, numbers, symbols, and whitespace are allowed regardless of script; every letter and combining mark must use the declared language's script. Foreign-script errors identify the exact text, line, context, code point, and Unicode character name. A chunk is accepted only when all four checks pass. If validation finds errors, the tool retries that chunk with the combined validator feedback appended to the original conversion instructions, using the same five-attempt retry limit as other conversion failures.
 
 ## Validate PDF to Markdown
 
@@ -99,7 +99,7 @@ A lower Markdown word count does not necessarily mean content is missing. Differ
 ### `gemini-md`
 
 ```bash
-uv run gemini-md [OPTIONS] PDF [PDF ...]
+uv run gemini-md --language LANGUAGE [OPTIONS] PDF [PDF ...]
 ```
 
 Arguments:
@@ -113,6 +113,7 @@ Options:
 | Flag | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-o, --output-dir OUTPUT_DIR` | Yes | None | Directory where Markdown files will be written. The directory is created if it does not exist. |
+| `--language LANGUAGE` | Yes | None | Language of the source book. The same language applies to every input PDF and determines the Unicode script allowed in converted text. Supported languages include Assamese, Awadhi, Bengali, Braj, English, Gujarati, Hindi, Kannada, Khari Boli, Malayalam, Marathi, Nepali, Odia, Persian, Punjabi, Sanskrit, Tamil, Telugu, and Urdu. |
 | `--chunk-size CHUNK_SIZE` | No | `10` | Pages per Gemini request for large PDFs. Must be greater than zero. PDFs with at most this many pages are converted in a single request. |
 | `--pages PAGES` | No | None | Convert a specific page or page range (for example, `3` or `3-15`) instead of the entire PDF. When multiple PDFs are provided, the same page selection is applied to each input. |
 | `--model MODEL` | No | `gemini-3.5-flash-lite` | Gemini model used for conversion. |
@@ -121,10 +122,10 @@ Options:
 Examples:
 
 ```bash
-uv run gemini-md -o /tmp/markdown /home/dman/Downloads/tinyspec.pdf
-uv run gemini-md --output-dir markdown --chunk-size 10 large-document.pdf
-uv run gemini-md --output-dir markdown --pages 3-15 /home/dman/Downloads/tinyspec.pdf
-uv run gemini-md --output-dir markdown --model gemini-3.5-flash-lite document.pdf
+uv run gemini-md --language Hindi -o /tmp/markdown /home/dman/Downloads/tinyspec.pdf
+uv run gemini-md --language Hindi --output-dir markdown --chunk-size 10 large-document.pdf
+uv run gemini-md --language Hindi --output-dir markdown --pages 3-15 /home/dman/Downloads/tinyspec.pdf
+uv run gemini-md --language Hindi --output-dir markdown --model gemini-3.5-flash-lite document.pdf
 ```
 
 ### `validate-count`

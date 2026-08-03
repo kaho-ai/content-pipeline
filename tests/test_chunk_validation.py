@@ -5,7 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from content_pipeline.gemini_md import convert_chunk, validate_chunk
+from content_pipeline.gemini_md import (
+    convert_chunk,
+    parse_args,
+    validate_chunk,
+    validate_language,
+)
 
 
 class FakeFiles:
@@ -51,8 +56,9 @@ class ValidateChunkTests(unittest.TestCase):
         errors = validate_chunk(
             client,
             uploaded_file,
-            "# Candidate",
+            "# प्रत्याशी",
             "test-model",
+            "hindi",
         )
 
         self.assertEqual(
@@ -71,11 +77,11 @@ class ValidateChunkTests(unittest.TestCase):
     def test_retries_conversion_with_aggregated_validation_feedback(self) -> None:
         client = FakeClient(
             [
-                "first draft",
+                "पहला English प्रारूप",
                 "1. A stanza from page 2 is missing.",
                 "PASS",
                 "PASS",
-                "corrected draft",
+                "सुधारा हुआ प्रारूप",
                 "PASS",
                 "PASS",
                 "PASS",
@@ -89,9 +95,10 @@ class ValidateChunkTests(unittest.TestCase):
                 chunk_index=0,
                 total_chunks=1,
                 model="test-model",
+                language="hindi",
             )
 
-        self.assertEqual(result, "corrected draft")
+        self.assertEqual(result, "सुधारा हुआ प्रारूप")
         self.assertEqual(client.files.uploaded, [Path("chunk.pdf"), Path("chunk.pdf")])
         self.assertEqual(len(client.models.calls), 8)
         sleep.assert_called_once_with(10)
@@ -99,8 +106,52 @@ class ValidateChunkTests(unittest.TestCase):
         retry_contents = client.models.calls[4]["contents"]
         self.assertEqual(len(retry_contents), 3)
         self.assertIn("previous conversion attempt failed validation", retry_contents[2])
+        self.assertIn("foreign-script text 'English'", retry_contents[2])
+        self.assertIn("U+0045 LATIN CAPITAL LETTER E", retry_contents[2])
         self.assertIn("Completeness and ordering", retry_contents[2])
         self.assertIn("A stanza from page 2 is missing.", retry_contents[2])
+
+
+class LanguageValidationTests(unittest.TestCase):
+    def test_reports_specific_latin_and_arabic_text_in_hindi_output(self) -> None:
+        errors = validate_language(
+            "# मानसरोवर\nयह English और اردو पाठ है। १२३ ₹!",
+            "hindi",
+        )
+        combined_errors = "\n".join(errors)
+
+        self.assertIn("line 2", combined_errors)
+        self.assertIn("'English'", combined_errors)
+        self.assertIn("U+0045 LATIN CAPITAL LETTER E", combined_errors)
+        self.assertIn("'اردو'", combined_errors)
+        self.assertIn("U+0627 ARABIC LETTER ALEF", combined_errors)
+        self.assertIn("Context:", combined_errors)
+
+    def test_allows_declared_script_punctuation_numbers_and_symbols(self) -> None:
+        errors = validate_language(
+            "# मानसरोवर\nयह हिन्दी पाठ है — १२३! ₹",
+            "Hindi",
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_language_is_required_and_normalized_by_the_cli(self) -> None:
+        args = parse_args(
+            [
+                "--language",
+                "Hindi",
+                "--output-dir",
+                "out",
+                "book.pdf",
+            ]
+        )
+        self.assertEqual(args.language, "hindi")
+
+        with (
+            patch("sys.stderr"),
+            self.assertRaises(SystemExit),
+        ):
+            parse_args(["--output-dir", "out", "book.pdf"])
 
 
 if __name__ == "__main__":

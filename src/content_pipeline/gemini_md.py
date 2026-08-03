@@ -4,6 +4,7 @@ import argparse
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from typing import Sequence
 
@@ -14,6 +15,78 @@ CHUNK_SIZE = 10  # pages per chunk
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 10  # seconds
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
+MAX_LANGUAGE_VIOLATIONS = 30
+
+LANGUAGE_SCRIPTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "assamese": ("Assamese", ("BENGALI",)),
+    "awadhi": ("Awadhi", ("DEVANAGARI", "VEDIC")),
+    "bengali": ("Bengali", ("BENGALI",)),
+    "braj": ("Braj", ("DEVANAGARI", "VEDIC")),
+    "english": ("English", ("LATIN",)),
+    "gujarati": ("Gujarati", ("GUJARATI",)),
+    "hindi": ("Hindi", ("DEVANAGARI", "VEDIC")),
+    "kannada": ("Kannada", ("KANNADA",)),
+    "khari boli": ("Khari Boli", ("DEVANAGARI", "VEDIC")),
+    "malayalam": ("Malayalam", ("MALAYALAM",)),
+    "marathi": ("Marathi", ("DEVANAGARI", "VEDIC")),
+    "nepali": ("Nepali", ("DEVANAGARI", "VEDIC")),
+    "odia": ("Odia", ("ORIYA",)),
+    "persian": ("Persian", ("ARABIC",)),
+    "punjabi": ("Punjabi", ("GURMUKHI",)),
+    "sanskrit": ("Sanskrit", ("DEVANAGARI", "VEDIC")),
+    "tamil": ("Tamil", ("TAMIL",)),
+    "telugu": ("Telugu", ("TELUGU",)),
+    "urdu": ("Urdu", ("ARABIC",)),
+}
+
+LANGUAGE_ALIASES = {
+    "as": "assamese",
+    "awa": "awadhi",
+    "bangla": "bengali",
+    "bn": "bengali",
+    "braj bhasha": "braj",
+    "en": "english",
+    "fa": "persian",
+    "farsi": "persian",
+    "gu": "gujarati",
+    "hi": "hindi",
+    "kn": "kannada",
+    "khari-boli": "khari boli",
+    "ml": "malayalam",
+    "mr": "marathi",
+    "ne": "nepali",
+    "or": "odia",
+    "oriya": "odia",
+    "pa": "punjabi",
+    "panjabi": "punjabi",
+    "sa": "sanskrit",
+    "ta": "tamil",
+    "te": "telugu",
+    "ur": "urdu",
+}
+
+
+def parse_language(value: str) -> str:
+    """Normalize a supported book language for script validation."""
+    normalized = " ".join(value.strip().casefold().split())
+    language = LANGUAGE_ALIASES.get(normalized, normalized)
+    if language not in LANGUAGE_SCRIPTS:
+        supported = ", ".join(
+            display_name
+            for display_name, _ in LANGUAGE_SCRIPTS.values()
+        )
+        raise argparse.ArgumentTypeError(
+            f"unsupported language '{value}'. Supported languages: {supported}"
+        )
+    return language
+
+
+def _language_details(language: str) -> tuple[str, tuple[str, ...]]:
+    """Return the display name and Unicode-name prefixes for a language."""
+    try:
+        return LANGUAGE_SCRIPTS[language]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported normalized language '{language}'") from exc
 
 
 def split_pdf(input_file: Path, chunk_size: int, tmp_dir: Path) -> list[Path]:
@@ -89,18 +162,102 @@ def parse_page_range(value: str) -> tuple[int, int]:
     return start, end
 
 
+def _uses_allowed_script(
+    character: str,
+    allowed_name_prefixes: tuple[str, ...],
+) -> bool:
+    """Return whether a Unicode character is neutral or uses an allowed script."""
+    category = unicodedata.category(character)
+    if category[0] not in {"L", "M"}:
+        return True
+
+    unicode_name = unicodedata.name(character, "")
+    return any(
+        unicode_name.startswith(prefix)
+        for prefix in allowed_name_prefixes
+    )
+
+
+def _describe_unicode_run(text: str) -> str:
+    """Describe each distinct character in a foreign-script text run."""
+    distinct_characters = dict.fromkeys(text)
+    return "; ".join(
+        f"{character!r} U+{ord(character):04X} "
+        f"{unicodedata.name(character, 'UNKNOWN')}"
+        for character in distinct_characters
+    )
+
+
+def validate_language(markdown_text: str, language: str) -> list[str]:
+    """Find foreign-script text while allowing punctuation, numbers, and symbols."""
+    normalized_language = parse_language(language)
+    display_name, allowed_name_prefixes = _language_details(normalized_language)
+    violations: list[tuple[int, str, str]] = []
+    seen_locations: set[tuple[int, str]] = set()
+
+    for line_number, line in enumerate(markdown_text.splitlines(), start=1):
+        run_start: int | None = None
+        for index in range(len(line) + 1):
+            is_foreign = (
+                index < len(line)
+                and not _uses_allowed_script(
+                    line[index],
+                    allowed_name_prefixes,
+                )
+            )
+            if is_foreign and run_start is None:
+                run_start = index
+                continue
+            if is_foreign or run_start is None:
+                continue
+
+            foreign_text = line[run_start:index]
+            location = (line_number, foreign_text)
+            if location not in seen_locations:
+                context_start = max(0, run_start - 40)
+                context_end = min(len(line), index + 40)
+                context = line[context_start:context_end].strip()
+                violations.append((line_number, foreign_text, context))
+                seen_locations.add(location)
+            run_start = None
+
+    errors = [
+        (
+            f"Language script ({display_name}): line {line_number} contains "
+            f"foreign-script text {foreign_text!r}. Unicode: "
+            f"{_describe_unicode_run(foreign_text)}. Context: {context!r}. "
+            f"Retranscribe this text in {display_name} using only the declared "
+            "language's script."
+        )
+        for line_number, foreign_text, context in violations[
+            :MAX_LANGUAGE_VIOLATIONS
+        ]
+    ]
+    if len(violations) > MAX_LANGUAGE_VIOLATIONS:
+        errors.append(
+            f"Language script ({display_name}): "
+            f"{len(violations) - MAX_LANGUAGE_VIOLATIONS} additional "
+            "foreign-script text runs were found after the detailed errors "
+            "above. Recheck the entire chunk for the same problem."
+        )
+    return errors
+
+
 def _run_validation_check(
     client: genai.Client,
     uploaded_file: object,
     markdown_text: str,
     model: str,
+    language: str,
     check_name: str,
     instructions: str,
 ) -> list[str]:
     """Run one focused validation check and return its actionable errors."""
+    display_name, _ = _language_details(language)
     validation_prompt = f"""
 You are a focused quality-control reviewer for a PDF-to-Markdown transcription.
 Compare the uploaded source PDF chunk with the candidate Markdown below.
+The declared language of the book is {display_name}.
 
 Validation check: {check_name}
 
@@ -134,6 +291,7 @@ def validate_completeness(
     uploaded_file: object,
     markdown_text: str,
     model: str,
+    language: str,
 ) -> list[str]:
     """Check that source content is present once and in the original order."""
     return _run_validation_check(
@@ -141,6 +299,7 @@ def validate_completeness(
         uploaded_file,
         markdown_text,
         model,
+        language,
         "Completeness and ordering",
         """
 Check that every source page is represented in order and that no legible
@@ -156,6 +315,7 @@ def validate_transcription_fidelity(
     uploaded_file: object,
     markdown_text: str,
     model: str,
+    language: str,
 ) -> list[str]:
     """Check transcription accuracy and preservation of historical language."""
     return _run_validation_check(
@@ -163,6 +323,7 @@ def validate_transcription_fidelity(
         uploaded_file,
         markdown_text,
         model,
+        language,
         "Transcription and orthographic fidelity",
         """
 Check the candidate against the source for incorrect, missing, or invented
@@ -170,7 +331,8 @@ words and punctuation. Pay particular attention to Devanagari glyphs, matras,
 conjuncts, Anusvara, Chandrabindu, Visarga, danda punctuation, verse numbers,
 and obvious OCR confusions. Confirm that genuine Braj, Awadhi, Sanskrit, and
 historical spellings were preserved rather than modernized, summarized, or
-translated.
+translated. Confirm that the text remains in the declared book language and
+flag foreign-language substitutions even when they use the same Unicode script.
 """,
     )
 
@@ -180,6 +342,7 @@ def validate_markdown_output(
     uploaded_file: object,
     markdown_text: str,
     model: str,
+    language: str,
 ) -> list[str]:
     """Check Markdown structure and the raw-output contract."""
     return _run_validation_check(
@@ -187,6 +350,7 @@ def validate_markdown_output(
         uploaded_file,
         markdown_text,
         model,
+        language,
         "Markdown structure and output contract",
         """
 Check that the output is raw Markdown without surrounding code fences,
@@ -202,19 +366,37 @@ def validate_chunk(
     uploaded_file: object,
     markdown_text: str,
     model: str,
+    language: str,
 ) -> list[str]:
     """Run every focused chunk validator and aggregate their errors."""
-    errors: list[str] = []
-    errors.extend(validate_completeness(client, uploaded_file, markdown_text, model))
+    errors = validate_language(markdown_text, language)
+    errors.extend(
+        validate_completeness(
+            client,
+            uploaded_file,
+            markdown_text,
+            model,
+            language,
+        )
+    )
     errors.extend(
         validate_transcription_fidelity(
             client,
             uploaded_file,
             markdown_text,
             model,
+            language,
         )
     )
-    errors.extend(validate_markdown_output(client, uploaded_file, markdown_text, model))
+    errors.extend(
+        validate_markdown_output(
+            client,
+            uploaded_file,
+            markdown_text,
+            model,
+            language,
+        )
+    )
     return errors
 
 
@@ -224,6 +406,7 @@ def convert_chunk(
     chunk_index: int,
     total_chunks: int,
     model: str,
+    language: str,
 ) -> str:
     """Convert and validate a chunk, retrying failures with validator feedback."""
     prompt = """
@@ -317,7 +500,7 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 **(दोहा)**. - Dedications or invocations (e.g., "ॐ","श्री गणेशाय नमः") keep as standalone italic lines using *...*. 
   - Sanskrit framing verses: many Awadhi/Braj devotional works (Tulsidas's Ramcharitmanas is the best-known example) open each major division with several Sanskrit श्लोक --- invocations distinct from the vernacular narrative that follows --- and often close it with a short Sanskrit passage too. If the source does this, keep these shlokas in Sanskrit exactly as scanned, set apart with a label such as "(संस्कृत श्लोक)" or a blockquote, and do NOT apply Rule 2's Braj/Awadhi archaic-verb-form logic to them --- they follow Sanskrit grammar, not Awadhi conjugation, so "correcting" them toward Awadhi forms would be as wrong as modernizing them.
 
-**9. Footnotes / टिप्पणी:** If there are footnotes (marked by *, †, or superscript numbers), convert them to Markdown footnotes ([^1]). Keep footnote identifiers unique across the entire document, not just within one poem --- e.g., number continuously, or prefix with a section tag like [^bk12-1] for a Bal Kand footnote. Most Markdown renderers treat footnote IDs as global to the whole document, so resetting to [^1] in every poem will make later definitions silently overwrite or fail to resolve earlier ones. Still place each footnote's definition at the end of its own poem, separated by a horizontal rule (---), so it stays visually close to its context even though the identifier itself is unique document-wide.
+**9. Footnotes / टिप्पणी:** If there are footnotes (marked by *, †, or superscript numbers), convert them to Markdown footnotes ([^1]). Keep footnote identifiers unique across the entire document by numbering them continuously rather than resetting to [^1] in every poem. Most Markdown renderers treat footnote IDs as global to the whole document, so reused identifiers will make later definitions silently overwrite or fail to resolve earlier ones. Still place each footnote's definition at the end of its own poem, separated by a horizontal rule (---), so it stays visually close to its context even though the identifier itself is unique document-wide.
 
 **10. Tables of Contents (अनुक्रमणिका):** If present, convert to a nested Markdown unordered list (- ), preserving indentation levels. Since page numbers are now preserved as markers throughout the body (Rule 6), keep the TOC's page-number references too --- they correspond to real, findable points in the converted document.
 
@@ -327,6 +510,19 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 - Return the converted document as raw Markdown without surrounding code fences or any other wrapper.
 - Process every page of the source, strictly in order. Do not skip, condense, merge, or silently omit any page, even one that seems repetitive, damaged, or hard to read --- transcribe what is legible and mark an unclear portion with something like [अस्पष्ट] rather than dropping the page.
 - Do not include any explanatory text, summaries, romanization, or feedback. Begin directly with the converted content, and return nothing except the converted text itself --- no commentary on the conversion process, no sentence noting that a section or page range is complete, and no note or guess about where a future response should resume. If the document is too long to finish in a single response, simply stop at the end of a poem or kand --- a clean structural boundary, never mid-verse. The last page-number marker already present in your own output is the resumption point; do not restate or re-estimate it in prose, since that kind of self-generated guess is redundant at best and has already produced an incorrect page number once."
+"""
+    normalized_language = parse_language(language)
+    display_name, allowed_name_prefixes = _language_details(normalized_language)
+    allowed_scripts = ", ".join(allowed_name_prefixes)
+    prompt += f"""
+
+**Declared Book Language (Mandatory):**
+- The book language is {display_name}.
+- Outside punctuation, numbers, symbols, and whitespace, every
+  Unicode letter and combining mark in the conversion must use the declared
+  language's script ({allowed_scripts}).
+- Do not substitute words in any other language or script. When a scan is
+  ambiguous, resolve it as {display_name} text using the declared script.
 """
     uploaded_file = None
     validation_errors: list[str] = []
@@ -369,6 +565,7 @@ while following all original conversion instructions:
                 uploaded_file,
                 text,
                 model,
+                normalized_language,
             )
             if current_validation_errors:
                 validation_errors = current_validation_errors
@@ -413,11 +610,14 @@ def convert_pdf(
     input_file: Path,
     output_dir: Path,
     client: genai.Client,
+    language: str,
     chunk_size: int = CHUNK_SIZE,
     model: str = DEFAULT_MODEL,
     page_range: tuple[int, int] | None = None,
 ) -> Path:
     """Split a large PDF, convert each chunk, concatenate the results, and write Markdown."""
+
+    normalized_language = parse_language(language)
 
     if not input_file.exists():
         raise FileNotFoundError(f"File '{input_file}' not found.")
@@ -467,7 +667,14 @@ def convert_pdf(
         # ------------------------------------------------------------
         if total_pages <= chunk_size:
             print("  Small file - converting directly...")
-            md_text = convert_chunk(client, working_file, 0, 1, model)
+            md_text = convert_chunk(
+                client,
+                working_file,
+                0,
+                1,
+                model,
+                normalized_language,
+            )
 
         else:
             with tempfile.TemporaryDirectory() as tmp_name:
@@ -494,6 +701,7 @@ def convert_pdf(
                             i,
                             len(chunk_paths),
                             model,
+                            normalized_language,
                         )
 
                         md_parts.append(md)
@@ -555,6 +763,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Directory where Markdown files will be written.",
     )
     parser.add_argument(
+        "--language",
+        type=parse_language,
+        required=True,
+        metavar="LANGUAGE",
+        help="Language of the source book; required for Unicode script validation.",
+    )
+    parser.add_argument(
         "--chunk-size",
         type=positive_int,
         default=CHUNK_SIZE,
@@ -585,6 +800,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 input_file=pdf_file,
                 output_dir=args.output_dir,
                 client=client,
+                language=args.language,
                 chunk_size=args.chunk_size,
                 model=args.model,
                 page_range=args.pages,
