@@ -1,21 +1,58 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tempfile
 import time
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 import pypdf
 from google import genai
 
-CHUNK_SIZE = 10  # pages per chunk
+BATCH_SIZE = 10  # pages per Gemini request
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 10  # seconds
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 MAX_LANGUAGE_VIOLATIONS = 30
+URL_PATTERN = re.compile(
+    r"(?:https?://|www\.)[^\s<>()\[\]{}]+",
+    re.IGNORECASE,
+)
+PAGE_MARKER_PATTERN = re.compile(
+    r"(?m)^<!-- source-page: ([1-9]\d*) -->[ \t]*$"
+)
+
+
+@dataclass(frozen=True)
+class BatchPage:
+    """One original PDF page included in a conversion batch."""
+
+    number: int
+
+
+@dataclass(frozen=True)
+class PageBatch:
+    """A Gemini request made from explicit, numbered source pages."""
+
+    pdf_path: Path
+    pages: tuple[BatchPage, ...]
+
+    @property
+    def page_numbers(self) -> tuple[int, ...]:
+        return tuple(page.number for page in self.pages)
+
+    @property
+    def page_label(self) -> str:
+        first_page = self.pages[0].number
+        last_page = self.pages[-1].number
+        if first_page == last_page:
+            return f"page {first_page}"
+        return f"pages {first_page}-{last_page}"
+
 
 LANGUAGE_SCRIPTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "assamese": ("Assamese", ("BENGALI",)),
@@ -89,50 +126,48 @@ def _language_details(language: str) -> tuple[str, tuple[str, ...]]:
         raise ValueError(f"Unsupported normalized language '{language}'") from exc
 
 
-def split_pdf(input_file: Path, chunk_size: int, tmp_dir: Path) -> list[Path]:
-    """Split a PDF into chunks of chunk_size pages."""
+def build_page_batches(
+    input_file: Path,
+    batch_size: int,
+    tmp_dir: Path,
+    page_range: tuple[int, int] | None = None,
+) -> list[PageBatch]:
+    """Build ordered batches from explicit original PDF pages."""
     reader = pypdf.PdfReader(input_file)
     total_pages = len(reader.pages)
-    chunk_paths: list[Path] = []
+    first_page, last_page = page_range or (1, total_pages)
+    if last_page > total_pages:
+        raise ValueError(
+            f"Page {last_page} exceeds PDF length ({total_pages})."
+        )
 
-    for start in range(0, total_pages, chunk_size):
-        end = min(start + chunk_size, total_pages)
+    batches: list[PageBatch] = []
+    for batch_start in range(first_page, last_page + 1, batch_size):
+        batch_end = min(batch_start + batch_size - 1, last_page)
+        pages = tuple(
+            BatchPage(number=page_number)
+            for page_number in range(batch_start, batch_end + 1)
+        )
+        batch_path = (
+            tmp_dir
+            / f"{input_file.stem}_batch_{batch_start:04d}-{batch_end:04d}.pdf"
+        )
+
         writer = pypdf.PdfWriter()
-        for page_num in range(start, end):
-            writer.add_page(reader.pages[page_num])
+        for page in pages:
+            writer.add_page(reader.pages[page.number - 1])
+        with batch_path.open("wb") as file:
+            writer.write(file)
 
-        chunk_path = tmp_dir / f"{input_file.stem}_chunk_{start + 1:04d}-{end:04d}.pdf"
-        with chunk_path.open("wb") as f:
-            writer.write(f)
-        chunk_paths.append(chunk_path)
+        batches.append(PageBatch(pdf_path=batch_path, pages=pages))
 
-    print(f"  Split into {len(chunk_paths)} chunks of up to {chunk_size} pages ({total_pages} total pages)")
-    return chunk_paths
-
-
-def extract_pdf_range(
-    input_file: Path,
-    reader: pypdf.PdfReader,
-    start_page: int,
-    end_page: int,
-    tmp_dir: Path,
-) -> Path:
-    """Write a 1-based inclusive page range to a temporary PDF."""
-
-    writer = pypdf.PdfWriter()
-
-    for page in range(start_page - 1, end_page):
-        writer.add_page(reader.pages[page])
-
-    range_path = (
-        tmp_dir /
-        f"{input_file.stem}_{start_page:04d}-{end_page:04d}.pdf"
+    selected_pages = last_page - first_page + 1
+    print(
+        f"  Prepared {len(batches)} page batches of up to {batch_size} pages "
+        f"({selected_pages} selected pages)"
     )
+    return batches
 
-    with range_path.open("wb") as f:
-        writer.write(f)
-
-    return range_path
 
 def parse_page_range(value: str) -> tuple[int, int]:
     """
@@ -188,76 +223,211 @@ def _describe_unicode_run(text: str) -> str:
     )
 
 
-def validate_language(markdown_text: str, language: str) -> list[str]:
+@dataclass(frozen=True)
+class MarkdownPageSection:
+    """Generated Markdown attributed to one original PDF page."""
+
+    page_number: int | None
+    text: str
+    first_output_line: int
+
+
+def _markdown_page_sections(markdown_text: str) -> list[MarkdownPageSection]:
+    """Split generated Markdown using required source-page markers."""
+    matches = list(PAGE_MARKER_PATTERN.finditer(markdown_text))
+    if not matches:
+        return [
+            MarkdownPageSection(
+                page_number=None,
+                text=markdown_text,
+                first_output_line=1,
+            )
+        ]
+
+    sections: list[MarkdownPageSection] = []
+    prefix = markdown_text[:matches[0].start()]
+    if prefix.strip():
+        sections.append(
+            MarkdownPageSection(
+                page_number=None,
+                text=prefix,
+                first_output_line=1,
+            )
+        )
+
+    for index, match in enumerate(matches):
+        content_start = match.end()
+        content_end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(markdown_text)
+        )
+        sections.append(
+            MarkdownPageSection(
+                page_number=int(match.group(1)),
+                text=markdown_text[content_start:content_end],
+                first_output_line=markdown_text.count(
+                    "\n",
+                    0,
+                    content_start,
+                )
+                + 1,
+            )
+        )
+    return sections
+
+
+def validate_page_markers(
+    markdown_text: str,
+    batch: PageBatch,
+) -> list[str]:
+    """Require one ordered source-page marker for every page in the batch."""
+    found_pages = tuple(
+        int(match.group(1))
+        for match in PAGE_MARKER_PATTERN.finditer(markdown_text)
+    )
+    if found_pages == batch.page_numbers:
+        return []
+    return [
+        f"[PAGE_MARKERS][{batch.page_label}] expected "
+        f"{batch.page_numbers}, found {found_pages}. Emit exactly one ordered "
+        "source-page marker before the content from each page."
+    ]
+
+
+def validate_language(
+    markdown_text: str,
+    language: str,
+    batch: PageBatch,
+) -> tuple[list[str], list[str]]:
     """Find foreign-script text while allowing punctuation, numbers, and symbols."""
     normalized_language = parse_language(language)
     display_name, allowed_name_prefixes = _language_details(normalized_language)
-    violations: list[tuple[int, str, str]] = []
-    seen_locations: set[tuple[int, str]] = set()
+    violations: list[tuple[str, int, str, str]] = []
+    seen_locations: set[tuple[str, int, str]] = set()
+    warnings: list[str] = []
+    seen_urls: set[tuple[str, int, str]] = set()
 
-    for line_number, line in enumerate(markdown_text.splitlines(), start=1):
-        run_start: int | None = None
-        for index in range(len(line) + 1):
-            is_foreign = (
-                index < len(line)
-                and not _uses_allowed_script(
-                    line[index],
-                    allowed_name_prefixes,
+    for section in _markdown_page_sections(markdown_text):
+        page_label = (
+            f"page {section.page_number}"
+            if section.page_number is not None
+            else batch.page_label
+        )
+        for section_line, line in enumerate(
+            section.text.splitlines(),
+            start=0,
+        ):
+            line_number = section.first_output_line + section_line
+            url_spans = []
+            for match in URL_PATTERN.finditer(line):
+                url = match.group(0).rstrip(".,;:!?।॥")
+                if url:
+                    url_spans.append(
+                        (match.start(), match.start() + len(url), url)
+                    )
+
+            run_start: int | None = None
+            for index in range(len(line) + 1):
+                is_foreign = (
+                    index < len(line)
+                    and not _uses_allowed_script(
+                        line[index],
+                        allowed_name_prefixes,
+                    )
                 )
-            )
-            if is_foreign and run_start is None:
-                run_start = index
-                continue
-            if is_foreign or run_start is None:
-                continue
+                if is_foreign and run_start is None:
+                    run_start = index
+                    continue
+                if is_foreign or run_start is None:
+                    continue
 
-            foreign_text = line[run_start:index]
-            location = (line_number, foreign_text)
-            if location not in seen_locations:
-                context_start = max(0, run_start - 40)
-                context_end = min(len(line), index + 40)
-                context = line[context_start:context_end].strip()
-                violations.append((line_number, foreign_text, context))
-                seen_locations.add(location)
-            run_start = None
+                foreign_text = line[run_start:index]
+                containing_url = next(
+                    (
+                        url
+                        for url_start, url_end, url in url_spans
+                        if run_start < url_end and index > url_start
+                    ),
+                    None,
+                )
+                if containing_url is not None:
+                    url_location = (
+                        page_label,
+                        line_number,
+                        containing_url,
+                    )
+                    if url_location not in seen_urls:
+                        context = line.strip()
+                        warnings.append(
+                            f"[FOREIGN_LANGUAGE_URL][{page_label}] "
+                            f"{containing_url!r}; output line {line_number}; "
+                            f"context: {context!r}"
+                        )
+                        seen_urls.add(url_location)
+                    run_start = None
+                    continue
+
+                location = (page_label, line_number, foreign_text)
+                if location not in seen_locations:
+                    context_start = max(0, run_start - 40)
+                    context_end = min(len(line), index + 40)
+                    context = line[context_start:context_end].strip()
+                    violations.append(
+                        (
+                            page_label,
+                            line_number,
+                            foreign_text,
+                            context,
+                        )
+                    )
+                    seen_locations.add(location)
+                run_start = None
 
     errors = [
         (
-            f"Language script ({display_name}): line {line_number} contains "
-            f"foreign-script text {foreign_text!r}. Unicode: "
+            f"[FOREIGN_LANGUAGE_TEXT][{page_label}] "
+            f"output line {line_number}; foreign text {foreign_text!r}; "
+            f"Unicode: "
             f"{_describe_unicode_run(foreign_text)}. Context: {context!r}. "
             f"Retranscribe this text in {display_name} using only the declared "
             "language's script."
         )
-        for line_number, foreign_text, context in violations[
+        for page_label, line_number, foreign_text, context in violations[
             :MAX_LANGUAGE_VIOLATIONS
         ]
     ]
     if len(violations) > MAX_LANGUAGE_VIOLATIONS:
         errors.append(
-            f"Language script ({display_name}): "
+            f"[FOREIGN_LANGUAGE_TEXT][{batch.page_label}] "
             f"{len(violations) - MAX_LANGUAGE_VIOLATIONS} additional "
             "foreign-script text runs were found after the detailed errors "
-            "above. Recheck the entire chunk for the same problem."
+            "above. Recheck the entire batch for the same problem."
         )
-    return errors
+    return errors, warnings
 
 
-def _run_validation_check(
+def _run_batch_validation_check(
     client: genai.Client,
     uploaded_file: object,
     markdown_text: str,
     model: str,
     language: str,
+    batch: PageBatch,
     check_name: str,
     instructions: str,
 ) -> list[str]:
-    """Run one focused validation check and return its actionable errors."""
+    """Run one focused batch validation and return its actionable errors."""
     display_name, _ = _language_details(language)
     validation_prompt = f"""
 You are a focused quality-control reviewer for a PDF-to-Markdown transcription.
-Compare the uploaded source PDF chunk with the candidate Markdown below.
+Compare the uploaded PDF page batch ({batch.page_label}) with the candidate
+Markdown below. The expected source pages are {batch.page_numbers}.
 The declared language of the book is {display_name}.
+Every page must begin with its exact `<!-- source-page: N -->` metadata marker;
+these markers are required boundaries, not explanatory commentary.
+Foreign-script text inside a URL is a non-failing warning handled separately;
+do not report a URL as an error in this validation check.
 
 Validation check: {check_name}
 
@@ -278,7 +448,7 @@ what the next conversion attempt must correct. Do not rewrite the document.
     )
     result = response.text
     if not result or not result.strip():
-        raise ValueError(f"Empty response from {check_name} chunk validator")
+        raise ValueError(f"Empty response from {check_name} batch validator")
 
     result = result.strip()
     if result.casefold() == "pass":
@@ -292,14 +462,16 @@ def validate_completeness(
     markdown_text: str,
     model: str,
     language: str,
+    batch: PageBatch,
 ) -> list[str]:
     """Check that source content is present once and in the original order."""
-    return _run_validation_check(
+    return _run_batch_validation_check(
         client,
         uploaded_file,
         markdown_text,
         model,
         language,
+        batch,
         "Completeness and ordering",
         """
 Check that every source page is represented in order and that no legible
@@ -316,14 +488,16 @@ def validate_transcription_fidelity(
     markdown_text: str,
     model: str,
     language: str,
+    batch: PageBatch,
 ) -> list[str]:
     """Check transcription accuracy and preservation of historical language."""
-    return _run_validation_check(
+    return _run_batch_validation_check(
         client,
         uploaded_file,
         markdown_text,
         model,
         language,
+        batch,
         "Transcription and orthographic fidelity",
         """
 Check the candidate against the source for incorrect, missing, or invented
@@ -343,14 +517,16 @@ def validate_markdown_output(
     markdown_text: str,
     model: str,
     language: str,
+    batch: PageBatch,
 ) -> list[str]:
     """Check Markdown structure and the raw-output contract."""
-    return _run_validation_check(
+    return _run_batch_validation_check(
         client,
         uploaded_file,
         markdown_text,
         model,
         language,
+        batch,
         "Markdown structure and output contract",
         """
 Check that the output is raw Markdown without surrounding code fences,
@@ -361,15 +537,22 @@ the source structure and follow the conversion requirements.
     )
 
 
-def validate_chunk(
+def validate_batch(
     client: genai.Client,
     uploaded_file: object,
     markdown_text: str,
     model: str,
     language: str,
-) -> list[str]:
-    """Run every focused chunk validator and aggregate their errors."""
-    errors = validate_language(markdown_text, language)
+    batch: PageBatch,
+) -> tuple[list[str], list[str]]:
+    """Run every focused page-batch validator and aggregate its findings."""
+    errors = validate_page_markers(markdown_text, batch)
+    language_errors, warnings = validate_language(
+        markdown_text,
+        language,
+        batch,
+    )
+    errors.extend(language_errors)
     errors.extend(
         validate_completeness(
             client,
@@ -377,6 +560,7 @@ def validate_chunk(
             markdown_text,
             model,
             language,
+            batch,
         )
     )
     errors.extend(
@@ -386,6 +570,7 @@ def validate_chunk(
             markdown_text,
             model,
             language,
+            batch,
         )
     )
     errors.extend(
@@ -395,20 +580,21 @@ def validate_chunk(
             markdown_text,
             model,
             language,
+            batch,
         )
     )
-    return errors
+    return errors, warnings
 
 
-def convert_chunk(
+def convert_batch(
     client: genai.Client,
-    chunk_path: Path,
-    chunk_index: int,
-    total_chunks: int,
+    batch: PageBatch,
+    batch_index: int,
+    total_batches: int,
     model: str,
     language: str,
 ) -> str:
-    """Convert and validate a chunk, retrying failures with validator feedback."""
+    """Convert and validate a page batch, retrying with validator feedback."""
     prompt = """
 "You are a Pandit-level digital archivist and Chhandashastra (छंदशास्त्र) scholar specialising in Hindi, Braj, Awadhi, and archaic Khari Boli poetry/prose from OCR-scanned antique PDFs. Your task is to convert the scanned Devanagari text into pristine, structurally perfect Markdown. DO NOT summarize, modernize, or translate the poetry into English or modern Hindi.
 
@@ -494,7 +680,7 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 **Delete** catchwords (the first word of the next page repeated at the bottom of the current one). 
 **Delete** page numbers. Join the text before and after it. Preserve appropriate spacing and punctuation. Do not leave an abrupt break.
 
-**A page number is a standalone marker disconnected from any specific verse, simply counting pages in sequence; a verse number (e.g., "॥ २ ॥") sits directly against the verse it closes, counting compositions, not pages. Keep both, but keep them visually distinct: page numbers use the template above on their own line at a stanza boundary; verse numbers stay attached to the verse they close, unchanged.**
+**A printed page number is separate from a verse number (e.g., "॥ २ ॥"). Delete printed page numbers, but keep verse numbers attached to the verse they close. The machine-readable source-page markers required below are metadata and must still be emitted; they are not transcriptions of printed page numbers.**
 
 **8. Titles, Subheadings, and Invocations (मंगलाचरण):** - Main book title → # (H1). - Section/Ramayana-type chapters (काण्ड) or major divisions → ## (H2). - A named composition that opens a genuinely distinct section --- a titled hymn, a labelled sub-episode, or the first shift into a new grouping --- → ### (H3). Do NOT give every individual दोहा, सोरठा, or चौपाई its own H3 as it recurs through a continuous passage; a single kand-length section can contain hundreds of each, and heading every one defeats the purpose of a heading hierarchy. Where you still want to flag the type of a recurring verse without a full heading, use a small inline label instead, e.g. 
 **(दोहा)**. - Dedications or invocations (e.g., "ॐ","श्री गणेशाय नमः") keep as standalone italic lines using *...*. 
@@ -502,25 +688,37 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 
 **9. Footnotes / टिप्पणी:** If there are footnotes (marked by *, †, or superscript numbers), convert them to Markdown footnotes ([^1]). Keep footnote identifiers unique across the entire document by numbering them continuously rather than resetting to [^1] in every poem. Most Markdown renderers treat footnote IDs as global to the whole document, so reused identifiers will make later definitions silently overwrite or fail to resolve earlier ones. Still place each footnote's definition at the end of its own poem, separated by a horizontal rule (---), so it stays visually close to its context even though the identifier itself is unique document-wide.
 
-**10. Tables of Contents (अनुक्रमणिका):** If present, convert to a nested Markdown unordered list (- ), preserving indentation levels. Since page numbers are now preserved as markers throughout the body (Rule 6), keep the TOC's page-number references too --- they correspond to real, findable points in the converted document.
+**10. Tables of Contents (अनुक्रमणिका):** If present, convert to a nested Markdown unordered list (- ), preserving indentation levels. Keep the TOC's printed page-number references because they correspond to the source-page markers in the converted document.
 
-**11. Mandatory Page‑by‑Page Processing (No Skipping):** Process every page of the source strictly in order. Do **not** skip, condense, merge, or silently omit any page, even if it seems repetitive, damaged, or hard to read. Transcribe what is legible; for entirely illegible portions, insert a bracketed note such as `[अस्पष्ट]` or `[पृष्ठ X – पूर्णतः अस्पष्ट]` and continue to the next page. If a page is blank, output only the page‑number marker (Rule 6) and a line `[रिक्त पृष्ठ]`. At the end of your conversion, verify that the sequence of page markers is continuous and includes every page from the first to the last; if any marker is missing, re‑examine your output.
+**11. Mandatory Page‑by‑Page Processing (No Skipping):** Process every page of the source strictly in order. Do **not** skip, condense, merge, or silently omit any page, even if it seems repetitive, damaged, or hard to read. Transcribe what is legible; for entirely illegible portions, insert a bracketed note such as `[अस्पष्ट]` or `[पृष्ठ X – पूर्णतः अस्पष्ट]` and continue to the next page. If a page is blank, emit its required source-page marker and a line `[रिक्त पृष्ठ]`. At the end of your conversion, verify that every page in the batch has exactly one marker in order.
 
 **Output Format:** 
 - Return the converted document as raw Markdown without surrounding code fences or any other wrapper.
 - Process every page of the source, strictly in order. Do not skip, condense, merge, or silently omit any page, even one that seems repetitive, damaged, or hard to read --- transcribe what is legible and mark an unclear portion with something like [अस्पष्ट] rather than dropping the page.
-- Do not include any explanatory text, summaries, romanization, or feedback. Begin directly with the converted content, and return nothing except the converted text itself --- no commentary on the conversion process, no sentence noting that a section or page range is complete, and no note or guess about where a future response should resume. If the document is too long to finish in a single response, simply stop at the end of a poem or kand --- a clean structural boundary, never mid-verse. The last page-number marker already present in your own output is the resumption point; do not restate or re-estimate it in prose, since that kind of self-generated guess is redundant at best and has already produced an incorrect page number once."
+- Do not include any explanatory text, summaries, romanization, or feedback. Begin directly with the first required source-page marker, and return nothing except the markers and converted text itself --- no commentary on the conversion process, no sentence noting that a batch is complete, and no note or guess about where a future response should resume."
 """
     normalized_language = parse_language(language)
     display_name, allowed_name_prefixes = _language_details(normalized_language)
     allowed_scripts = ", ".join(allowed_name_prefixes)
+    expected_markers = "\n".join(
+        f"<!-- source-page: {page.number} -->"
+        for page in batch.pages
+    )
     prompt += f"""
+
+**Source Page Boundaries (Mandatory):**
+- This batch contains these original PDF pages in order: {batch.page_numbers}.
+- Before the converted content from each page, emit its exact marker:
+{expected_markers}
+- Emit every marker exactly once and in that order, including for blank or
+  illegible pages. These metadata markers are the only permitted Latin text.
 
 **Declared Book Language (Mandatory):**
 - The book language is {display_name}.
 - Outside punctuation, numbers, symbols, and whitespace, every
   Unicode letter and combining mark in the conversion must use the declared
-  language's script ({allowed_scripts}).
+  language's script ({allowed_scripts}). The required source-page markers above
+  are the sole exception.
 - Do not substitute words in any other language or script. When a scan is
   ambiguous, resolve it as {display_name} text using the declared script.
 """
@@ -534,7 +732,7 @@ Reference matra counts for the common metres here, so foot-completion is a concr
                 except Exception:
                     pass
 
-            uploaded_file = client.files.upload(file=chunk_path)
+            uploaded_file = client.files.upload(file=batch.pdf_path)
 
             conversion_contents = [uploaded_file, prompt]
             if validation_errors:
@@ -560,17 +758,20 @@ while following all original conversion instructions:
             if not text or not text.strip():
                 raise ValueError("Empty response from Gemini")
 
-            current_validation_errors = validate_chunk(
+            current_validation_errors, current_validation_warnings = validate_batch(
                 client,
                 uploaded_file,
                 text,
                 model,
                 normalized_language,
+                batch,
             )
+            for warning in current_validation_warnings:
+                print(f"  WARNING {warning}")
             if current_validation_errors:
                 validation_errors = current_validation_errors
                 raise ValueError(
-                    "Chunk validation failed:\n"
+                    "Batch validation failed:\n"
                     + "\n".join(validation_errors)
                 )
 
@@ -581,8 +782,8 @@ while following all original conversion instructions:
             uploaded_file = None
 
             print(
-                f"  Chunk {chunk_index + 1}/{total_chunks} converted "
-                "and validated successfully"
+                f"  Batch {batch_index + 1}/{total_batches} "
+                f"({batch.page_label}) converted and validated successfully"
             )
             return text
 
@@ -595,11 +796,18 @@ while following all original conversion instructions:
                 uploaded_file = None
 
             if attempt == MAX_RETRIES:
-                print(f"  Chunk {chunk_index + 1}/{total_chunks} FAILED after {MAX_RETRIES} attempts: {exc}")
+                print(
+                    f"  Batch {batch_index + 1}/{total_batches} "
+                    f"({batch.page_label}) FAILED after {MAX_RETRIES} "
+                    f"attempts: {exc}"
+                )
                 raise
 
             backoff = INITIAL_BACKOFF * (2 ** (attempt - 1))
-            print(f"  Chunk {chunk_index + 1}/{total_chunks} attempt {attempt} failed: {exc}")
+            print(
+                f"  Batch {batch_index + 1}/{total_batches} "
+                f"({batch.page_label}) attempt {attempt} failed: {exc}"
+            )
             print(f"    Retrying in {backoff}s...")
             time.sleep(backoff)
 
@@ -611,11 +819,11 @@ def convert_pdf(
     output_dir: Path,
     client: genai.Client,
     language: str,
-    chunk_size: int = CHUNK_SIZE,
+    batch_size: int = BATCH_SIZE,
     model: str = DEFAULT_MODEL,
     page_range: tuple[int, int] | None = None,
 ) -> Path:
-    """Split a large PDF, convert each chunk, concatenate the results, and write Markdown."""
+    """Convert ordered batches of numbered PDF pages into one Markdown file."""
 
     normalized_language = parse_language(language)
 
@@ -632,118 +840,69 @@ def convert_pdf(
     total_pages = len(reader.pages)
     print(f"  Total pages: {total_pages}")
 
-    temp_dir = None
-    working_file = input_file
+    if page_range is not None:
+        print(f"  Selecting pages {page_range[0]}-{page_range[1]}...")
 
-    try:
-        # ------------------------------------------------------------
-        # Extract page range if requested
-        # ------------------------------------------------------------
-        if page_range is not None:
-            start_page, end_page = page_range
+    with tempfile.TemporaryDirectory() as tmp_name:
+        batches = build_page_batches(
+            input_file,
+            batch_size,
+            Path(tmp_name),
+            page_range,
+        )
+        markdown_batches = []
 
-            if end_page > total_pages:
-                raise ValueError(
-                    f"Page {end_page} exceeds PDF length ({total_pages})."
+        for batch_index, batch in enumerate(batches):
+            if batch_index > 0:
+                print("  Sleeping for 3 seconds between batches...")
+                time.sleep(3)
+
+            print(
+                f"  Processing batch {batch_index + 1}/{len(batches)} "
+                f"({batch.page_label})..."
+            )
+            try:
+                markdown_batches.append(
+                    convert_batch(
+                        client,
+                        batch,
+                        batch_index,
+                        len(batches),
+                        model,
+                        normalized_language,
+                    )
+                )
+            except Exception:
+                print(
+                    f"  Skipping batch {batch_index + 1} "
+                    f"({batch.page_label}) due to repeated failures."
+                )
+                markdown_batches.append(
+                    "\n\n".join(
+                        f"<!-- source-page: {page.number} -->\n"
+                        f"<!-- CONVERSION FAILED: page {page.number} -->"
+                        for page in batch.pages
+                    )
                 )
 
-            print(f"  Selecting pages {start_page}-{end_page}...")
+        md_text = "\n\n".join(markdown_batches)
 
-            temp_dir = tempfile.TemporaryDirectory()
-
-            working_file = extract_pdf_range(
-                input_file,
-                reader,
-                start_page,
-                end_page,
-                Path(temp_dir.name),
-            )
-
-            reader = pypdf.PdfReader(working_file)
-            total_pages = len(reader.pages)
-
-        # ------------------------------------------------------------
-        # Convert
-        # ------------------------------------------------------------
-        if total_pages <= chunk_size:
-            print("  Small file - converting directly...")
-            md_text = convert_chunk(
-                client,
-                working_file,
-                0,
-                1,
-                model,
-                normalized_language,
-            )
-
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if page_range is None:
+        output_stem = input_file.stem
+    else:
+        start, end = page_range
+        if start == end:
+            output_stem = f"{input_file.stem}_page_{start}"
         else:
-            with tempfile.TemporaryDirectory() as tmp_name:
-                tmp_dir = Path(tmp_name)
+            output_stem = f"{input_file.stem}_pages_{start}-{end}"
 
-                chunk_paths = split_pdf(
-                    working_file,
-                    chunk_size,
-                    tmp_dir,
-                )
+    output_file = output_dir / f"{output_stem}.md"
+    output_file.write_text(md_text, encoding="utf-8")
 
-                md_parts = []
+    print(f"  Success! Markdown saved to '{output_file}'")
+    return output_file
 
-                for i, chunk_path in enumerate(chunk_paths):
-
-                    if i > 0:
-                        print("  Sleeping for 3 seconds between requests...")
-                        time.sleep(3)
-
-                    try:
-                        md = convert_chunk(
-                            client,
-                            chunk_path,
-                            i,
-                            len(chunk_paths),
-                            model,
-                            normalized_language,
-                        )
-
-                        md_parts.append(md)
-
-                    except Exception:
-                        print(
-                            f"  Skipping chunk {i + 1} due to repeated failures."
-                        )
-
-                        start = i * chunk_size + 1
-                        end = min((i + 1) * chunk_size, total_pages)
-
-                        md_parts.append(
-                            f"\n\n<!-- CONVERSION FAILED: pages {start}-{end} -->\n\n"
-                        )
-
-                md_text = "\n\n".join(md_parts)
-
-        # ------------------------------------------------------------
-        # Output filename
-        # ------------------------------------------------------------
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if page_range is None:
-            output_stem = input_file.stem
-        else:
-            start, end = page_range
-
-            if start == end:
-                output_stem = f"{input_file.stem}_page_{start}"
-            else:
-                output_stem = f"{input_file.stem}_pages_{start}-{end}"
-
-        output_file = output_dir / f"{output_stem}.md"
-        output_file.write_text(md_text, encoding="utf-8")
-
-        print(f"  Success! Markdown saved to '{output_file}'")
-        return output_file
-
-    finally:
-        if temp_dir is not None:
-            temp_dir.cleanup()
 
 def positive_int(value: str) -> int:
     parsed = int(value)
@@ -770,10 +929,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Language of the source book; required for Unicode script validation.",
     )
     parser.add_argument(
-        "--chunk-size",
+        "--batch-size",
         type=positive_int,
-        default=CHUNK_SIZE,
-        help=f"Pages per Gemini request for large PDFs. Defaults to {CHUNK_SIZE}.",
+        default=BATCH_SIZE,
+        help=f"Numbered pages per Gemini batch. Defaults to {BATCH_SIZE}.",
     )
     parser.add_argument(
         "--pages",
@@ -801,7 +960,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_dir=args.output_dir,
                 client=client,
                 language=args.language,
-                chunk_size=args.chunk_size,
+                batch_size=args.batch_size,
                 model=args.model,
                 page_range=args.pages,
             )
