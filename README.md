@@ -81,7 +81,9 @@ If Gemini returns `PROHIBITED_CONTENT` without text, the retry feedback states
 that the input is public-domain literary text being converted faithfully for
 archival purposes and was flagged incorrectly. The reported finish reason is
 preserved in terminal output instead of being reduced to a generic empty-response
-message.
+message. A blocked multi-page request is split into one request per source page;
+all of those single-page requests are submitted together in the next Gemini
+Batch API job, validated independently, and reassembled in source-page order.
 
 ## Validate PDF to Markdown
 

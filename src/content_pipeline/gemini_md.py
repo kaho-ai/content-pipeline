@@ -97,6 +97,14 @@ class PageBatch:
         return f"pages {first_page}-{last_page}"
 
 
+@dataclass(frozen=True)
+class ConversionUnit:
+    """One independent request belonging to an original page batch."""
+
+    parent_index: int
+    batch: PageBatch
+
+
 LANGUAGE_SCRIPTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "assamese": ("Assamese", ("BENGALI",)),
     "awadhi": ("Awadhi", ("DEVANAGARI", "VEDIC")),
@@ -210,6 +218,30 @@ def build_page_batches(
         f"({selected_pages} selected pages)"
     )
     return batches
+
+
+def split_page_batch(batch: PageBatch) -> list[PageBatch]:
+    """Write one single-page PDF for every page in an existing page batch."""
+    reader = pypdf.PdfReader(batch.pdf_path)
+    if len(reader.pages) != len(batch.pages):
+        raise ValueError(
+            f"{batch.page_label} has {len(batch.pages)} source-page labels "
+            f"but its PDF contains {len(reader.pages)} pages"
+        )
+
+    single_page_batches = []
+    for pdf_page, source_page in zip(reader.pages, batch.pages, strict=True):
+        page_path = batch.pdf_path.with_name(
+            f"{batch.pdf_path.stem}_page_{source_page.number:04d}.pdf"
+        )
+        writer = pypdf.PdfWriter()
+        writer.add_page(pdf_page)
+        with page_path.open("wb") as file:
+            writer.write(file)
+        single_page_batches.append(
+            PageBatch(pdf_path=page_path, pages=(source_page,))
+        )
+    return single_page_batches
 
 
 def parse_page_range(value: str) -> tuple[int, int]:
@@ -483,6 +515,16 @@ def _empty_response_error(response: object, request_name: str) -> str:
             + ", ".join(finish_reasons)
         )
     return f"{request_name}: empty response from Gemini"
+
+
+def _response_has_finish_reason(response: object, reason_name: str) -> bool:
+    """Return whether any response candidate ended for the named reason."""
+    for candidate in getattr(response, "candidates", None) or []:
+        finish_reason = getattr(candidate, "finish_reason", None)
+        candidate_reason = getattr(finish_reason, "name", str(finish_reason))
+        if candidate_reason == reason_name:
+            return True
+    return False
 
 
 def _run_batch_validation_check(
@@ -1001,42 +1043,53 @@ def convert_batches_with_batch_api(
 ) -> list[str]:
     """Convert and validate page batches through asynchronous Batch API jobs."""
     normalized_language = parse_language(language)
-    uploaded_files: dict[int, object] = {}
-    markdown_results: list[str | None] = [None] * len(batches)
-    validation_feedback: dict[int, list[str]] = {
-        index: [] for index in range(len(batches))
+    original_units = [
+        ConversionUnit(parent_index=index, batch=batch)
+        for index, batch in enumerate(batches)
+    ]
+    units_by_parent: dict[int, list[ConversionUnit]] = {
+        unit.parent_index: [unit] for unit in original_units
     }
-    pending = set(range(len(batches)))
+    uploaded_files: dict[ConversionUnit, object] = {}
+    markdown_results: dict[ConversionUnit, str] = {}
+    validation_feedback: dict[ConversionUnit, list[str]] = {
+        unit: [] for unit in original_units
+    }
+    pending = set(original_units)
+
+    def unit_sort_key(unit: ConversionUnit) -> tuple[int, tuple[int, ...]]:
+        return unit.parent_index, unit.batch.page_numbers
+
+    def upload_unit(unit: ConversionUnit) -> None:
+        uploaded_files[unit] = client.files.upload(file=unit.batch.pdf_path)
 
     try:
-        for batch_index, batch in enumerate(batches):
+        for unit in original_units:
             print(
-                f"  Uploading batch {batch_index + 1}/{len(batches)} "
-                f"({batch.page_label})..."
+                f"  Uploading batch {unit.parent_index + 1}/{len(batches)} "
+                f"({unit.batch.page_label})..."
             )
-            uploaded_files[batch_index] = client.files.upload(
-                file=batch.pdf_path
-            )
+            upload_unit(unit)
 
         for attempt in range(1, MAX_RETRIES + 1):
-            request_indices = sorted(pending)
+            request_units = sorted(pending, key=unit_sort_key)
             conversion_requests = [
                 types.InlinedRequest(
                     contents=_conversion_contents(
-                        uploaded_files[batch_index],
+                        uploaded_files[unit],
                         _conversion_prompt(
-                            batches[batch_index],
+                            unit.batch,
                             normalized_language,
                         ),
-                        validation_feedback[batch_index],
+                        validation_feedback[unit],
                     ),
                     metadata={
                         "stage": "conversion",
-                        "batch_index": str(batch_index),
-                        "pages": batches[batch_index].page_label,
+                        "batch_index": str(unit.parent_index),
+                        "pages": unit.batch.page_label,
                     },
                 )
-                for batch_index in request_indices
+                for unit in request_units
             ]
             conversion_responses = _run_batch_api_job(
                 client,
@@ -1045,10 +1098,11 @@ def convert_batches_with_batch_api(
                 f"content-pipeline-conversion-attempt-{attempt}",
             )
 
-            candidates: dict[int, str] = {}
-            attempt_errors: dict[int, list[str]] = {}
-            for batch_index, inline_response in zip(
-                request_indices,
+            candidates: dict[ConversionUnit, str] = {}
+            attempt_errors: dict[ConversionUnit, list[str]] = {}
+            prohibited_units: dict[ConversionUnit, str] = {}
+            for unit, inline_response in zip(
+                request_units,
                 conversion_responses,
                 strict=True,
             ):
@@ -1057,46 +1111,85 @@ def convert_batches_with_batch_api(
                     "Conversion",
                 )
                 if error is not None:
-                    attempt_errors[batch_index] = [error]
+                    response = getattr(inline_response, "response", None)
+                    if (
+                        len(unit.batch.pages) > 1
+                        and _response_has_finish_reason(
+                            response,
+                            "PROHIBITED_CONTENT",
+                        )
+                    ):
+                        prohibited_units[unit] = error
+                    else:
+                        attempt_errors[unit] = [error]
                 else:
                     assert text is not None
-                    candidates[batch_index] = text
+                    candidates[unit] = text
+
+            for unit, error in prohibited_units.items():
+                print(
+                    f"  Batch {unit.parent_index + 1}/{len(batches)} "
+                    f"({unit.batch.page_label}) attempt {attempt} failed:"
+                )
+                print(f"    {error}")
+                single_page_units = [
+                    ConversionUnit(
+                        parent_index=unit.parent_index,
+                        batch=single_page_batch,
+                    )
+                    for single_page_batch in split_page_batch(unit.batch)
+                ]
+                units_by_parent[unit.parent_index] = single_page_units
+                pending.remove(unit)
+                print(
+                    f"  Splitting {unit.batch.page_label} into "
+                    f"{len(single_page_units)} single-page requests for the "
+                    "next Gemini Batch API job."
+                )
+                for single_page_unit in single_page_units:
+                    print(f"    Uploading {single_page_unit.batch.page_label}...")
+                    upload_unit(single_page_unit)
+                    validation_feedback[single_page_unit] = [error]
+                    pending.add(single_page_unit)
 
             validation_requests: list[types.InlinedRequest] = []
-            validation_request_keys: list[tuple[int, str]] = []
-            warnings_by_batch: dict[int, list[str]] = {}
-            for batch_index, markdown_text in candidates.items():
-                batch = batches[batch_index]
-                marker_errors = validate_page_markers(markdown_text, batch)
+            validation_request_keys: list[tuple[ConversionUnit, str]] = []
+            warnings_by_unit: dict[ConversionUnit, list[str]] = {}
+            for unit, markdown_text in candidates.items():
+                marker_errors = validate_page_markers(
+                    markdown_text,
+                    unit.batch,
+                )
                 language_errors, warnings = validate_language(
                     markdown_text,
                     normalized_language,
-                    batch,
+                    unit.batch,
                 )
-                attempt_errors[batch_index] = marker_errors + language_errors
-                warnings_by_batch[batch_index] = warnings
+                attempt_errors[unit] = marker_errors + language_errors
+                warnings_by_unit[unit] = warnings
 
                 for check_name, instructions in AI_VALIDATION_CHECKS:
                     validation_requests.append(
                         types.InlinedRequest(
                             contents=[
-                                uploaded_files[batch_index],
+                                uploaded_files[unit],
                                 _validation_prompt(
                                     markdown_text,
                                     normalized_language,
-                                    batch,
+                                    unit.batch,
                                     check_name,
                                     instructions,
                                 ),
                             ],
                             metadata={
                                 "stage": "validation",
-                                "batch_index": str(batch_index),
+                                "batch_index": str(unit.parent_index),
+                                "pages": unit.batch.page_label,
                                 "check": check_name,
                             },
                         )
                     )
-                    validation_request_keys.append((batch_index, check_name))
+                    validation_request_keys.append((unit, check_name))
 
             if validation_requests:
                 validation_responses = _run_batch_api_job(
@@ -1105,7 +1198,7 @@ def convert_batches_with_batch_api(
                     validation_requests,
                     f"content-pipeline-validation-attempt-{attempt}",
                 )
-                for (batch_index, check_name), inline_response in zip(
+                for (unit, check_name), inline_response in zip(
                     validation_request_keys,
                     validation_responses,
                     strict=True,
@@ -1115,37 +1208,37 @@ def convert_batches_with_batch_api(
                         f"{check_name} batch validator",
                     )
                     if error is not None:
-                        attempt_errors[batch_index].append(error)
+                        attempt_errors[unit].append(error)
                         continue
                     try:
-                        attempt_errors[batch_index].extend(
+                        attempt_errors[unit].extend(
                             _parse_validation_result(result, check_name)
                         )
                     except ValueError as validation_error:
-                        attempt_errors[batch_index].append(
-                            str(validation_error)
-                        )
+                        attempt_errors[unit].append(str(validation_error))
 
-            for batch_index in request_indices:
-                errors = attempt_errors.get(batch_index, [])
-                batch = batches[batch_index]
+            for unit in request_units:
+                if unit in prohibited_units:
+                    continue
+                errors = attempt_errors.get(unit, [])
                 if errors:
-                    validation_feedback[batch_index] = errors
+                    validation_feedback[unit] = errors
                     print(
-                        f"  Batch {batch_index + 1}/{len(batches)} "
-                        f"({batch.page_label}) attempt {attempt} failed:"
+                        f"  Batch {unit.parent_index + 1}/{len(batches)} "
+                        f"({unit.batch.page_label}) attempt {attempt} failed:"
                     )
                     for error in errors:
                         print(f"    {error}")
                     continue
 
-                markdown_results[batch_index] = candidates[batch_index]
-                pending.remove(batch_index)
-                for warning in warnings_by_batch[batch_index]:
+                markdown_results[unit] = candidates[unit]
+                pending.remove(unit)
+                for warning in warnings_by_unit[unit]:
                     print(f"  WARNING {warning}")
                 print(
-                    f"  Batch {batch_index + 1}/{len(batches)} "
-                    f"({batch.page_label}) converted and validated successfully"
+                    f"  Batch {unit.parent_index + 1}/{len(batches)} "
+                    f"({unit.batch.page_label}) converted and validated "
+                    "successfully"
                 )
 
             if not pending:
@@ -1153,23 +1246,34 @@ def convert_batches_with_batch_api(
             if attempt < MAX_RETRIES:
                 backoff = INITIAL_BACKOFF * (2 ** (attempt - 1))
                 print(
-                    f"  Retrying {len(pending)} failed page batch(es) "
+                    f"  Retrying {len(pending)} failed page request(s) "
                     f"in {backoff}s..."
                 )
                 time.sleep(backoff)
 
-        for batch_index in sorted(pending):
-            batch = batches[batch_index]
+        for unit in sorted(pending, key=unit_sort_key):
             print(
-                f"  Batch {batch_index + 1}/{len(batches)} "
-                f"({batch.page_label}) FAILED after {MAX_RETRIES} attempts"
+                f"  Batch {unit.parent_index + 1}/{len(batches)} "
+                f"({unit.batch.page_label}) FAILED after {MAX_RETRIES} attempts"
             )
-            markdown_results[batch_index] = _failed_batch_markdown(batch)
+            markdown_results[unit] = _failed_batch_markdown(unit.batch)
 
-        return [
-            result if result is not None else _failed_batch_markdown(batches[index])
-            for index, result in enumerate(markdown_results)
-        ]
+        assembled_results = []
+        for parent_index in range(len(batches)):
+            parent_units = sorted(
+                units_by_parent[parent_index],
+                key=unit_sort_key,
+            )
+            assembled_results.append(
+                "\n\n".join(
+                    markdown_results.get(
+                        unit,
+                        _failed_batch_markdown(unit.batch),
+                    )
+                    for unit in parent_units
+                )
+            )
+        return assembled_results
     finally:
         for uploaded_file in uploaded_files.values():
             try:

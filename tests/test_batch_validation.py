@@ -386,6 +386,72 @@ class ValidateBatchTests(unittest.TestCase):
 
 
 class AsyncBatchApiTests(unittest.TestCase):
+    def test_prohibited_multi_page_batch_splits_into_single_page_requests(
+        self,
+    ) -> None:
+        prohibited_response = genai_types.GenerateContentResponse(
+            candidates=[
+                genai_types.Candidate(
+                    finish_reason=genai_types.FinishReason.PROHIBITED_CONTENT
+                )
+            ]
+        )
+        page_markdown = [
+            f"<!-- source-page: {page_number} -->\nपृष्ठ {page_number}"
+            for page_number in (21, 22, 23)
+        ]
+        client = FakeClient(
+            [],
+            [
+                [prohibited_response],
+                page_markdown,
+                ["PASS"] * 9,
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_name:
+            batch_path = Path(tmp_name) / "batch_0021-0023.pdf"
+            writer = pypdf.PdfWriter()
+            for page_number in (21, 22, 23):
+                writer.add_blank_page(width=page_number, height=100)
+            with batch_path.open("wb") as file:
+                writer.write(file)
+            batch = PageBatch(
+                pdf_path=batch_path,
+                pages=tuple(
+                    BatchPage(page_number)
+                    for page_number in (21, 22, 23)
+                ),
+            )
+
+            with patch("content_pipeline.gemini_md.time.sleep") as sleep:
+                results = convert_batches_with_batch_api(
+                    client,
+                    [batch],
+                    "test-model",
+                    "hindi",
+                )
+
+        self.assertEqual(results, ["\n\n".join(page_markdown)])
+        self.assertEqual(
+            [len(call["src"]) for call in client.batches.calls],
+            [1, 3, 9],
+        )
+        split_requests = client.batches.calls[1]["src"]
+        self.assertEqual(
+            [request.metadata["pages"] for request in split_requests],
+            ["page 21", "page 22", "page 23"],
+        )
+        self.assertTrue(
+            all(
+                "public-domain literary text" in request.contents[2]
+                for request in split_requests
+            )
+        )
+        self.assertEqual(len(client.files.uploaded), 4)
+        self.assertEqual(len(client.files.deleted), 4)
+        sleep.assert_called_once_with(10)
+
     def test_polls_until_batch_job_finishes(self) -> None:
         client = FakeClient([])
         client.batches = PollingFakeBatches()
