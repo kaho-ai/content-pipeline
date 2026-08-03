@@ -136,7 +136,7 @@ class ValidateBatchTests(unittest.TestCase):
     def test_retries_batch_with_exact_page_validation_feedback(self) -> None:
         client = FakeClient(
             [
-                "<!-- source-page: 7 -->\nपहला English प्रारूप",
+                "<!-- source-page: 7 -->\nपहला प्रारूप",
                 "1. A stanza from page 7 is missing.",
                 "PASS",
                 "PASS",
@@ -172,10 +172,54 @@ class ValidateBatchTests(unittest.TestCase):
         retry_contents = client.models.calls[4]["contents"]
         self.assertEqual(len(retry_contents), 3)
         self.assertIn("previous conversion attempt failed validation", retry_contents[2])
-        self.assertIn("[FOREIGN_LANGUAGE_TEXT][page 7]", retry_contents[2])
-        self.assertIn("foreign text 'English'", retry_contents[2])
-        self.assertIn("U+0045 LATIN CAPITAL LETTER E", retry_contents[2])
         self.assertIn("A stanza from page 7 is missing.", retry_contents[2])
+
+    def test_foreign_text_warning_prints_every_occurrence_without_retrying(
+        self,
+    ) -> None:
+        markdown = (
+            "<!-- source-page: 7 -->\n"
+            "पहला English प्रारूप और اردو पाठ"
+        )
+        client = FakeClient([markdown, "PASS", "PASS", "PASS"])
+        batch = make_batch(7)
+        output = io.StringIO()
+
+        with (
+            redirect_stdout(output),
+            patch("content_pipeline.gemini_md.time.sleep") as sleep,
+        ):
+            result = convert_batch(
+                client,
+                batch,
+                batch_index=0,
+                total_batches=1,
+                model="test-model",
+                language="hindi",
+            )
+
+        self.assertEqual(result, markdown)
+        self.assertEqual(len(client.models.calls), 4)
+        sleep.assert_not_called()
+        validation_prompts = [
+            call["contents"][1]
+            for call in client.models.calls[1:]
+        ]
+        self.assertTrue(
+            all(
+                "Do not report foreign-script text as an error" in prompt
+                for prompt in validation_prompts
+            )
+        )
+        printed = output.getvalue()
+        self.assertIn(
+            "WARNING [FOREIGN_LANGUAGE_TEXT][page 7] 'English'",
+            printed,
+        )
+        self.assertIn(
+            "WARNING [FOREIGN_LANGUAGE_TEXT][page 7] 'اردو'",
+            printed,
+        )
 
     def test_url_warning_prints_exact_page_without_retrying(self) -> None:
         markdown = (
@@ -208,7 +252,7 @@ class ValidateBatchTests(unittest.TestCase):
         ]
         self.assertTrue(
             all(
-                "do not report a URL as an error" in prompt
+                "Do not report foreign-script text as an error" in prompt
                 for prompt in validation_prompts
             )
         )
@@ -228,15 +272,28 @@ class PageValidationTests(unittest.TestCase):
         )
 
         errors, warnings = validate_language(markdown, "hindi", batch)
-        combined_errors = "\n".join(errors)
+        combined_warnings = "\n".join(warnings)
 
-        self.assertEqual(warnings, [])
-        self.assertIn("[FOREIGN_LANGUAGE_TEXT][page 41]", combined_errors)
-        self.assertIn("'English'", combined_errors)
-        self.assertIn("U+0045 LATIN CAPITAL LETTER E", combined_errors)
-        self.assertIn("'اردو'", combined_errors)
-        self.assertIn("U+0627 ARABIC LETTER ALEF", combined_errors)
-        self.assertIn("Context:", combined_errors)
+        self.assertEqual(errors, [])
+        self.assertIn("[FOREIGN_LANGUAGE_TEXT][page 41]", combined_warnings)
+        self.assertIn("'English'", combined_warnings)
+        self.assertIn("'اردو'", combined_warnings)
+        self.assertIn("context:", combined_warnings)
+
+    def test_reports_every_foreign_text_occurrence(self) -> None:
+        batch = make_batch(8)
+        markdown = "<!-- source-page: 8 -->\n" + "\n".join(
+            f"पाठ Foreign{index}"
+            for index in range(35)
+        )
+
+        errors, warnings = validate_language(markdown, "hindi", batch)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 35)
+        self.assertIn("'Foreign'", warnings[0])
+        self.assertIn("context: 'पाठ Foreign0'", warnings[0])
+        self.assertIn("context: 'पाठ Foreign34'", warnings[-1])
 
     def test_allows_declared_script_punctuation_numbers_and_symbols(self) -> None:
         batch = make_batch(3)

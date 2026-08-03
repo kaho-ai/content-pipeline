@@ -17,7 +17,6 @@ BATCH_SIZE = 10  # pages per Gemini request
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 10  # seconds
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-MAX_LANGUAGE_VIOLATIONS = 30
 URL_PATTERN = re.compile(
     r"(?:https?://|www\.)[^\s<>()\[\]{}]+",
     re.IGNORECASE,
@@ -213,16 +212,6 @@ def _uses_allowed_script(
     )
 
 
-def _describe_unicode_run(text: str) -> str:
-    """Describe each distinct character in a foreign-script text run."""
-    distinct_characters = dict.fromkeys(text)
-    return "; ".join(
-        f"{character!r} U+{ord(character):04X} "
-        f"{unicodedata.name(character, 'UNKNOWN')}"
-        for character in distinct_characters
-    )
-
-
 @dataclass(frozen=True)
 class MarkdownPageSection:
     """Generated Markdown attributed to one original PDF page."""
@@ -300,10 +289,9 @@ def validate_language(
     language: str,
     batch: PageBatch,
 ) -> tuple[list[str], list[str]]:
-    """Find foreign-script text while allowing punctuation, numbers, and symbols."""
+    """Return non-failing warnings for every foreign-script text run."""
     normalized_language = parse_language(language)
-    display_name, allowed_name_prefixes = _language_details(normalized_language)
-    violations: list[tuple[str, int, str, str]] = []
+    _, allowed_name_prefixes = _language_details(normalized_language)
     seen_locations: set[tuple[str, int, str]] = set()
     warnings: list[str] = []
     seen_urls: set[tuple[str, int, str]] = set()
@@ -373,38 +361,15 @@ def validate_language(
                     context_start = max(0, run_start - 40)
                     context_end = min(len(line), index + 40)
                     context = line[context_start:context_end].strip()
-                    violations.append(
-                        (
-                            page_label,
-                            line_number,
-                            foreign_text,
-                            context,
-                        )
+                    warnings.append(
+                        f"[FOREIGN_LANGUAGE_TEXT][{page_label}] "
+                        f"{foreign_text!r}; output line {line_number}; "
+                        f"context: {context!r}"
                     )
                     seen_locations.add(location)
                 run_start = None
 
-    errors = [
-        (
-            f"[FOREIGN_LANGUAGE_TEXT][{page_label}] "
-            f"output line {line_number}; foreign text {foreign_text!r}; "
-            f"Unicode: "
-            f"{_describe_unicode_run(foreign_text)}. Context: {context!r}. "
-            f"Retranscribe this text in {display_name} using only the declared "
-            "language's script."
-        )
-        for page_label, line_number, foreign_text, context in violations[
-            :MAX_LANGUAGE_VIOLATIONS
-        ]
-    ]
-    if len(violations) > MAX_LANGUAGE_VIOLATIONS:
-        errors.append(
-            f"[FOREIGN_LANGUAGE_TEXT][{batch.page_label}] "
-            f"{len(violations) - MAX_LANGUAGE_VIOLATIONS} additional "
-            "foreign-script text runs were found after the detailed errors "
-            "above. Recheck the entire batch for the same problem."
-        )
-    return errors, warnings
+    return [], warnings
 
 
 def _run_batch_validation_check(
@@ -426,8 +391,9 @@ Markdown below. The expected source pages are {batch.page_numbers}.
 The declared language of the book is {display_name}.
 Every page must begin with its exact `<!-- source-page: N -->` metadata marker;
 these markers are required boundaries, not explanatory commentary.
-Foreign-script text inside a URL is a non-failing warning handled separately;
-do not report a URL as an error in this validation check.
+Foreign-script text is a non-failing review warning handled separately, whether
+it is ordinary prose or part of a URL.
+Do not report foreign-script text as an error in this validation check.
 
 Validation check: {check_name}
 
@@ -766,14 +732,14 @@ while following all original conversion instructions:
                 normalized_language,
                 batch,
             )
-            for warning in current_validation_warnings:
-                print(f"  WARNING {warning}")
             if current_validation_errors:
                 validation_errors = current_validation_errors
                 raise ValueError(
                     "Batch validation failed:\n"
                     + "\n".join(validation_errors)
                 )
+            for warning in current_validation_warnings:
+                print(f"  WARNING {warning}")
 
             try:
                 client.files.delete(name=uploaded_file.name)
