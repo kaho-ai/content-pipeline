@@ -36,6 +36,23 @@ Convert a PDF to Markdown:
 uv run gemini-md --language Hindi --output-dir markdown path/to/document.pdf
 ```
 
+This uses the asynchronous Gemini Batch API by default. The command submits all
+pending page-batch conversions together, polls the job until it finishes, then
+submits the three AI validation checks together in a second Batch API job. Only
+page batches that fail conversion or validation are submitted again.
+
+Use synchronous `generate_content` requests instead when immediate interactive
+processing is preferable:
+
+```bash
+uv run gemini-md --sync --language Hindi --output-dir markdown path/to/document.pdf
+```
+
+[Gemini Batch API jobs](https://ai.google.dev/gemini-api/docs/batch-api) may take
+substantially longer than synchronous requests; Google specifies a target
+turnaround time of up to 24 hours. Pressing Ctrl-C while the command is polling
+attempts to cancel the active remote batch job.
+
 Convert multiple PDFs in one run:
 
 ```bash
@@ -117,6 +134,7 @@ Options:
 | `--batch-size BATCH_SIZE` | No | `10` | Number of explicit source pages included in each Gemini batch. Must be greater than zero. |
 | `--pages PAGES` | No | None | Convert a specific page or page range (for example, `3` or `3-15`) instead of the entire PDF. When multiple PDFs are provided, the same page selection is applied to each input. |
 | `--model MODEL` | No | `gemini-3.5-flash-lite` | Gemini model used for conversion. |
+| `--sync` | No | Disabled | Override the default asynchronous Gemini Batch API and use synchronous `generate_content` calls. |
 | `-h, --help` | No | None | Show command help and exit. |
 
 Examples:
@@ -126,6 +144,7 @@ uv run gemini-md --language Hindi -o /tmp/markdown /home/dman/Downloads/tinyspec
 uv run gemini-md --language Hindi --output-dir markdown --batch-size 10 large-document.pdf
 uv run gemini-md --language Hindi --output-dir markdown --pages 3-15 /home/dman/Downloads/tinyspec.pdf
 uv run gemini-md --language Hindi --output-dir markdown --model gemini-3.5-flash-lite document.pdf
+uv run gemini-md --sync --language Hindi --output-dir markdown document.pdf
 ```
 
 ### `validate-count`

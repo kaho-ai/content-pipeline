@@ -12,10 +12,12 @@ from typing import Sequence
 
 import pypdf
 from google import genai
+from google.genai import types
 
 BATCH_SIZE = 10  # pages per Gemini request
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 10  # seconds
+BATCH_POLL_INTERVAL = 30  # seconds
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 URL_PATTERN = re.compile(
     r"(?:https?://|www\.)[^\s<>()\[\]{}]+",
@@ -23,6 +25,42 @@ URL_PATTERN = re.compile(
 )
 PAGE_MARKER_PATTERN = re.compile(
     r"(?m)^<!-- source-page: ([1-9]\d*) -->[ \t]*$"
+)
+
+COMPLETENESS_CHECK = (
+    "Completeness and ordering",
+    """
+Check that every source page is represented in order and that no legible
+passage, stanza, heading, table entry, footnote, or other substantive content
+was skipped, duplicated, condensed, or invented. Ignore running headers,
+catchwords, printing marks, and standalone printed page numbers.
+""",
+)
+TRANSCRIPTION_FIDELITY_CHECK = (
+    "Transcription and orthographic fidelity",
+    """
+Check the candidate against the source for incorrect, missing, or invented
+words and punctuation. Pay particular attention to Devanagari glyphs, matras,
+conjuncts, Anusvara, Chandrabindu, Visarga, danda punctuation, verse numbers,
+and obvious OCR confusions. Confirm that genuine Braj, Awadhi, Sanskrit, and
+historical spellings were preserved rather than modernized, summarized, or
+translated. Confirm that the text remains in the declared book language and
+flag foreign-language substitutions even when they use the same Unicode script.
+""",
+)
+MARKDOWN_OUTPUT_CHECK = (
+    "Markdown structure and output contract",
+    """
+Check that the output is raw Markdown without surrounding code fences,
+explanatory commentary, summaries, or completion notes. Confirm that headings,
+lists, footnotes, stanza breaks, emphasis, and relative indentation preserve
+the source structure and follow the conversion requirements.
+""",
+)
+AI_VALIDATION_CHECKS = (
+    COMPLETENESS_CHECK,
+    TRANSCRIPTION_FIDELITY_CHECK,
+    MARKDOWN_OUTPUT_CHECK,
 )
 
 
@@ -372,19 +410,16 @@ def validate_language(
     return [], warnings
 
 
-def _run_batch_validation_check(
-    client: genai.Client,
-    uploaded_file: object,
+def _validation_prompt(
     markdown_text: str,
-    model: str,
     language: str,
     batch: PageBatch,
     check_name: str,
     instructions: str,
-) -> list[str]:
-    """Run one focused batch validation and return its actionable errors."""
+) -> str:
+    """Build one focused AI validation prompt."""
     display_name, _ = _language_details(language)
-    validation_prompt = f"""
+    return f"""
 You are a focused quality-control reviewer for a PDF-to-Markdown transcription.
 Compare the uploaded PDF page batch ({batch.page_label}) with the candidate
 Markdown below. The expected source pages are {batch.page_numbers}.
@@ -408,11 +443,10 @@ what the next conversion attempt must correct. Do not rewrite the document.
 {markdown_text}
 --- END CANDIDATE MARKDOWN ---
 """
-    response = client.models.generate_content(
-        model=model,
-        contents=[uploaded_file, validation_prompt],
-    )
-    result = response.text
+
+
+def _parse_validation_result(result: str | None, check_name: str) -> list[str]:
+    """Turn one AI validator response into actionable errors."""
     if not result or not result.strip():
         raise ValueError(f"Empty response from {check_name} batch validator")
 
@@ -420,6 +454,31 @@ what the next conversion attempt must correct. Do not rewrite the document.
     if result.casefold() == "pass":
         return []
     return [f"{check_name}: {result}"]
+
+
+def _run_batch_validation_check(
+    client: genai.Client,
+    uploaded_file: object,
+    markdown_text: str,
+    model: str,
+    language: str,
+    batch: PageBatch,
+    check_name: str,
+    instructions: str,
+) -> list[str]:
+    """Run one focused batch validation and return its actionable errors."""
+    validation_prompt = _validation_prompt(
+        markdown_text,
+        language,
+        batch,
+        check_name,
+        instructions,
+    )
+    response = client.models.generate_content(
+        model=model,
+        contents=[uploaded_file, validation_prompt],
+    )
+    return _parse_validation_result(response.text, check_name)
 
 
 def validate_completeness(
@@ -438,13 +497,7 @@ def validate_completeness(
         model,
         language,
         batch,
-        "Completeness and ordering",
-        """
-Check that every source page is represented in order and that no legible
-passage, stanza, heading, table entry, footnote, or other substantive content
-was skipped, duplicated, condensed, or invented. Ignore running headers,
-catchwords, printing marks, and standalone printed page numbers.
-""",
+        *COMPLETENESS_CHECK,
     )
 
 
@@ -464,16 +517,7 @@ def validate_transcription_fidelity(
         model,
         language,
         batch,
-        "Transcription and orthographic fidelity",
-        """
-Check the candidate against the source for incorrect, missing, or invented
-words and punctuation. Pay particular attention to Devanagari glyphs, matras,
-conjuncts, Anusvara, Chandrabindu, Visarga, danda punctuation, verse numbers,
-and obvious OCR confusions. Confirm that genuine Braj, Awadhi, Sanskrit, and
-historical spellings were preserved rather than modernized, summarized, or
-translated. Confirm that the text remains in the declared book language and
-flag foreign-language substitutions even when they use the same Unicode script.
-""",
+        *TRANSCRIPTION_FIDELITY_CHECK,
     )
 
 
@@ -493,13 +537,7 @@ def validate_markdown_output(
         model,
         language,
         batch,
-        "Markdown structure and output contract",
-        """
-Check that the output is raw Markdown without surrounding code fences,
-explanatory commentary, summaries, or completion notes. Confirm that headings,
-lists, footnotes, stanza breaks, emphasis, and relative indentation preserve
-the source structure and follow the conversion requirements.
-""",
+        *MARKDOWN_OUTPUT_CHECK,
     )
 
 
@@ -552,15 +590,11 @@ def validate_batch(
     return errors, warnings
 
 
-def convert_batch(
-    client: genai.Client,
+def _conversion_prompt(
     batch: PageBatch,
-    batch_index: int,
-    total_batches: int,
-    model: str,
     language: str,
 ) -> str:
-    """Convert and validate a page batch, retrying with validator feedback."""
+    """Build the shared PDF-to-Markdown conversion prompt for one page batch."""
     prompt = """
 "You are a Pandit-level digital archivist and Chhandashastra (छंदशास्त्र) scholar specialising in Hindi, Braj, Awadhi, and archaic Khari Boli poetry/prose from OCR-scanned antique PDFs. Your task is to convert the scanned Devanagari text into pristine, structurally perfect Markdown. DO NOT summarize, modernize, or translate the poetry into English or modern Hindi.
 
@@ -688,6 +722,43 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 - Do not substitute words in any other language or script. When a scan is
   ambiguous, resolve it as {display_name} text using the declared script.
 """
+    return prompt
+
+
+def _conversion_contents(
+    uploaded_file: object,
+    prompt: str,
+    validation_errors: Sequence[str],
+) -> list[object]:
+    """Build conversion request contents, including prior validation feedback."""
+    contents: list[object] = [uploaded_file, prompt]
+    if validation_errors:
+        formatted_errors = "\n\n".join(
+            f"{index}. {error}"
+            for index, error in enumerate(validation_errors, start=1)
+        )
+        contents.append(
+            """
+The previous conversion attempt failed validation. Correct every issue below
+while following all original conversion instructions:
+
+"""
+            + formatted_errors
+        )
+    return contents
+
+
+def convert_batch(
+    client: genai.Client,
+    batch: PageBatch,
+    batch_index: int,
+    total_batches: int,
+    model: str,
+    language: str,
+) -> str:
+    """Synchronously convert and validate one page batch with retries."""
+    normalized_language = parse_language(language)
+    prompt = _conversion_prompt(batch, normalized_language)
     uploaded_file = None
     validation_errors: list[str] = []
     for attempt in range(1, MAX_RETRIES + 1):
@@ -700,20 +771,11 @@ Reference matra counts for the common metres here, so foot-completion is a concr
 
             uploaded_file = client.files.upload(file=batch.pdf_path)
 
-            conversion_contents = [uploaded_file, prompt]
-            if validation_errors:
-                formatted_errors = "\n\n".join(
-                    f"{index}. {error}"
-                    for index, error in enumerate(validation_errors, start=1)
-                )
-                conversion_contents.append(
-                    """
-The previous conversion attempt failed validation. Correct every issue below
-while following all original conversion instructions:
-
-"""
-                    + formatted_errors
-                )
+            conversion_contents = _conversion_contents(
+                uploaded_file,
+                prompt,
+                validation_errors,
+            )
 
             response = client.models.generate_content(
                 model=model,
@@ -780,6 +842,308 @@ while following all original conversion instructions:
     raise RuntimeError("unreachable retry state")
 
 
+def _batch_job_state_name(batch_job: object) -> str:
+    """Return a stable state name from either an SDK enum or test double."""
+    state = getattr(batch_job, "state", None)
+    if state is None:
+        return "JOB_STATE_UNSPECIFIED"
+    return getattr(state, "name", str(state))
+
+
+def _batch_error_text(error: object | None) -> str:
+    """Return the useful message from a Batch API job or request error."""
+    if error is None:
+        return "unknown Batch API error"
+    message = getattr(error, "message", None)
+    if message:
+        return str(message)
+    return str(error)
+
+
+def _run_batch_api_job(
+    client: genai.Client,
+    model: str,
+    requests: Sequence[types.InlinedRequest],
+    display_name: str,
+) -> list[types.InlinedResponse]:
+    """Submit, poll, and return one inline Gemini Batch API job."""
+    if not requests:
+        return []
+
+    batch_job = client.batches.create(
+        model=model,
+        src=list(requests),
+        config={"display_name": display_name},
+    )
+    if not batch_job.name:
+        raise RuntimeError("Gemini Batch API returned a job without a name")
+
+    print(
+        f"  Created Gemini Batch API job {batch_job.name} "
+        f"with {len(requests)} requests"
+    )
+    terminal_states = {
+        "JOB_STATE_SUCCEEDED",
+        "JOB_STATE_FAILED",
+        "JOB_STATE_CANCELLED",
+        "JOB_STATE_EXPIRED",
+    }
+    last_state = ""
+    try:
+        while _batch_job_state_name(batch_job) not in terminal_states:
+            state_name = _batch_job_state_name(batch_job)
+            if state_name != last_state:
+                print(f"  Batch API job {batch_job.name}: {state_name}")
+                last_state = state_name
+            time.sleep(BATCH_POLL_INTERVAL)
+            batch_job = client.batches.get(name=batch_job.name)
+    except KeyboardInterrupt:
+        try:
+            client.batches.cancel(name=batch_job.name)
+            print(f"  Cancelled Gemini Batch API job {batch_job.name}")
+        except Exception as cancel_error:
+            print(
+                f"  WARNING unable to cancel Batch API job {batch_job.name}: "
+                f"{cancel_error}"
+            )
+        raise
+
+    state_name = _batch_job_state_name(batch_job)
+    print(f"  Batch API job {batch_job.name}: {state_name}")
+    if state_name != "JOB_STATE_SUCCEEDED":
+        raise RuntimeError(
+            f"Gemini Batch API job {batch_job.name} ended in {state_name}: "
+            f"{_batch_error_text(getattr(batch_job, 'error', None))}"
+        )
+
+    destination = getattr(batch_job, "dest", None)
+    responses = (
+        getattr(destination, "inlined_responses", None)
+        if destination is not None
+        else None
+    )
+    if responses is None:
+        raise RuntimeError(
+            f"Gemini Batch API job {batch_job.name} returned no inline responses"
+        )
+    if len(responses) != len(requests):
+        raise RuntimeError(
+            f"Gemini Batch API job {batch_job.name} returned "
+            f"{len(responses)} responses for {len(requests)} requests"
+        )
+    return list(responses)
+
+
+def _batch_response_text(
+    inline_response: types.InlinedResponse,
+    request_name: str,
+) -> tuple[str | None, str | None]:
+    """Return either response text or a concise per-request Batch API error."""
+    error = getattr(inline_response, "error", None)
+    if error is not None:
+        return None, f"{request_name}: {_batch_error_text(error)}"
+
+    response = getattr(inline_response, "response", None)
+    text = getattr(response, "text", None) if response is not None else None
+    if not text or not text.strip():
+        return None, f"{request_name}: empty response from Gemini"
+    return text, None
+
+
+def _failed_batch_markdown(batch: PageBatch) -> str:
+    """Return explicit per-page markers for a batch that exhausted retries."""
+    return "\n\n".join(
+        f"<!-- source-page: {page.number} -->\n"
+        f"<!-- CONVERSION FAILED: page {page.number} -->"
+        for page in batch.pages
+    )
+
+
+def convert_batches_with_batch_api(
+    client: genai.Client,
+    batches: Sequence[PageBatch],
+    model: str,
+    language: str,
+) -> list[str]:
+    """Convert and validate page batches through asynchronous Batch API jobs."""
+    normalized_language = parse_language(language)
+    uploaded_files: dict[int, object] = {}
+    markdown_results: list[str | None] = [None] * len(batches)
+    validation_feedback: dict[int, list[str]] = {
+        index: [] for index in range(len(batches))
+    }
+    pending = set(range(len(batches)))
+
+    try:
+        for batch_index, batch in enumerate(batches):
+            print(
+                f"  Uploading batch {batch_index + 1}/{len(batches)} "
+                f"({batch.page_label})..."
+            )
+            uploaded_files[batch_index] = client.files.upload(
+                file=batch.pdf_path
+            )
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            request_indices = sorted(pending)
+            conversion_requests = [
+                types.InlinedRequest(
+                    contents=_conversion_contents(
+                        uploaded_files[batch_index],
+                        _conversion_prompt(
+                            batches[batch_index],
+                            normalized_language,
+                        ),
+                        validation_feedback[batch_index],
+                    ),
+                    metadata={
+                        "stage": "conversion",
+                        "batch_index": str(batch_index),
+                        "pages": batches[batch_index].page_label,
+                    },
+                )
+                for batch_index in request_indices
+            ]
+            conversion_responses = _run_batch_api_job(
+                client,
+                model,
+                conversion_requests,
+                f"content-pipeline-conversion-attempt-{attempt}",
+            )
+
+            candidates: dict[int, str] = {}
+            attempt_errors: dict[int, list[str]] = {}
+            for batch_index, inline_response in zip(
+                request_indices,
+                conversion_responses,
+                strict=True,
+            ):
+                text, error = _batch_response_text(
+                    inline_response,
+                    "Conversion",
+                )
+                if error is not None:
+                    attempt_errors[batch_index] = [error]
+                else:
+                    assert text is not None
+                    candidates[batch_index] = text
+
+            validation_requests: list[types.InlinedRequest] = []
+            validation_request_keys: list[tuple[int, str]] = []
+            warnings_by_batch: dict[int, list[str]] = {}
+            for batch_index, markdown_text in candidates.items():
+                batch = batches[batch_index]
+                marker_errors = validate_page_markers(markdown_text, batch)
+                language_errors, warnings = validate_language(
+                    markdown_text,
+                    normalized_language,
+                    batch,
+                )
+                attempt_errors[batch_index] = marker_errors + language_errors
+                warnings_by_batch[batch_index] = warnings
+
+                for check_name, instructions in AI_VALIDATION_CHECKS:
+                    validation_requests.append(
+                        types.InlinedRequest(
+                            contents=[
+                                uploaded_files[batch_index],
+                                _validation_prompt(
+                                    markdown_text,
+                                    normalized_language,
+                                    batch,
+                                    check_name,
+                                    instructions,
+                                ),
+                            ],
+                            metadata={
+                                "stage": "validation",
+                                "batch_index": str(batch_index),
+                                "check": check_name,
+                            },
+                        )
+                    )
+                    validation_request_keys.append((batch_index, check_name))
+
+            if validation_requests:
+                validation_responses = _run_batch_api_job(
+                    client,
+                    model,
+                    validation_requests,
+                    f"content-pipeline-validation-attempt-{attempt}",
+                )
+                for (batch_index, check_name), inline_response in zip(
+                    validation_request_keys,
+                    validation_responses,
+                    strict=True,
+                ):
+                    result, error = _batch_response_text(
+                        inline_response,
+                        f"{check_name} batch validator",
+                    )
+                    if error is not None:
+                        attempt_errors[batch_index].append(error)
+                        continue
+                    try:
+                        attempt_errors[batch_index].extend(
+                            _parse_validation_result(result, check_name)
+                        )
+                    except ValueError as validation_error:
+                        attempt_errors[batch_index].append(
+                            str(validation_error)
+                        )
+
+            for batch_index in request_indices:
+                errors = attempt_errors.get(batch_index, [])
+                batch = batches[batch_index]
+                if errors:
+                    validation_feedback[batch_index] = errors
+                    print(
+                        f"  Batch {batch_index + 1}/{len(batches)} "
+                        f"({batch.page_label}) attempt {attempt} failed:"
+                    )
+                    for error in errors:
+                        print(f"    {error}")
+                    continue
+
+                markdown_results[batch_index] = candidates[batch_index]
+                pending.remove(batch_index)
+                for warning in warnings_by_batch[batch_index]:
+                    print(f"  WARNING {warning}")
+                print(
+                    f"  Batch {batch_index + 1}/{len(batches)} "
+                    f"({batch.page_label}) converted and validated successfully"
+                )
+
+            if not pending:
+                break
+            if attempt < MAX_RETRIES:
+                backoff = INITIAL_BACKOFF * (2 ** (attempt - 1))
+                print(
+                    f"  Retrying {len(pending)} failed page batch(es) "
+                    f"in {backoff}s..."
+                )
+                time.sleep(backoff)
+
+        for batch_index in sorted(pending):
+            batch = batches[batch_index]
+            print(
+                f"  Batch {batch_index + 1}/{len(batches)} "
+                f"({batch.page_label}) FAILED after {MAX_RETRIES} attempts"
+            )
+            markdown_results[batch_index] = _failed_batch_markdown(batch)
+
+        return [
+            result if result is not None else _failed_batch_markdown(batches[index])
+            for index, result in enumerate(markdown_results)
+        ]
+    finally:
+        for uploaded_file in uploaded_files.values():
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+
+
 def convert_pdf(
     input_file: Path,
     output_dir: Path,
@@ -788,8 +1152,9 @@ def convert_pdf(
     batch_size: int = BATCH_SIZE,
     model: str = DEFAULT_MODEL,
     page_range: tuple[int, int] | None = None,
+    sync: bool = False,
 ) -> Path:
-    """Convert ordered batches of numbered PDF pages into one Markdown file."""
+    """Convert numbered pages with Batch API by default or synchronously."""
 
     normalized_language = parse_language(language)
 
@@ -816,40 +1181,43 @@ def convert_pdf(
             Path(tmp_name),
             page_range,
         )
-        markdown_batches = []
+        if sync:
+            print("  Execution mode: synchronous generate_content API")
+            markdown_batches = []
+            for batch_index, batch in enumerate(batches):
+                if batch_index > 0:
+                    print("  Sleeping for 3 seconds between batches...")
+                    time.sleep(3)
 
-        for batch_index, batch in enumerate(batches):
-            if batch_index > 0:
-                print("  Sleeping for 3 seconds between batches...")
-                time.sleep(3)
-
-            print(
-                f"  Processing batch {batch_index + 1}/{len(batches)} "
-                f"({batch.page_label})..."
-            )
-            try:
-                markdown_batches.append(
-                    convert_batch(
-                        client,
-                        batch,
-                        batch_index,
-                        len(batches),
-                        model,
-                        normalized_language,
-                    )
-                )
-            except Exception:
                 print(
-                    f"  Skipping batch {batch_index + 1} "
-                    f"({batch.page_label}) due to repeated failures."
+                    f"  Processing batch {batch_index + 1}/{len(batches)} "
+                    f"({batch.page_label})..."
                 )
-                markdown_batches.append(
-                    "\n\n".join(
-                        f"<!-- source-page: {page.number} -->\n"
-                        f"<!-- CONVERSION FAILED: page {page.number} -->"
-                        for page in batch.pages
+                try:
+                    markdown_batches.append(
+                        convert_batch(
+                            client,
+                            batch,
+                            batch_index,
+                            len(batches),
+                            model,
+                            normalized_language,
+                        )
                     )
-                )
+                except Exception:
+                    print(
+                        f"  Skipping batch {batch_index + 1} "
+                        f"({batch.page_label}) due to repeated failures."
+                    )
+                    markdown_batches.append(_failed_batch_markdown(batch))
+        else:
+            print("  Execution mode: asynchronous Gemini Batch API")
+            markdown_batches = convert_batches_with_batch_api(
+                client,
+                batches,
+                model,
+                normalized_language,
+            )
 
         md_text = "\n\n".join(markdown_batches)
 
@@ -911,6 +1279,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_MODEL,
         help=f"Gemini model to use. Defaults to {DEFAULT_MODEL}.",
     )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help=(
+            "Use synchronous generate_content requests instead of the "
+            "default asynchronous Gemini Batch API."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -929,6 +1305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 model=args.model,
                 page_range=args.pages,
+                sync=args.sync,
             )
         except Exception as exc:
             failures += 1

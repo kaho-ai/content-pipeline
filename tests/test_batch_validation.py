@@ -9,12 +9,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pypdf
+from google.genai import types as genai_types
 
 from content_pipeline.gemini_md import (
+    BATCH_POLL_INTERVAL,
     BatchPage,
     PageBatch,
+    _run_batch_api_job,
     build_page_batches,
     convert_batch,
+    convert_batches_with_batch_api,
+    convert_pdf,
     parse_args,
     validate_batch,
     validate_language,
@@ -36,7 +41,12 @@ class FakeFiles:
 
     def upload(self, *, file: Path) -> object:
         self.uploaded.append(file)
-        return SimpleNamespace(name=f"files/batch-{len(self.uploaded)}")
+        file_number = len(self.uploaded)
+        return genai_types.File(
+            name=f"files/batch-{file_number}",
+            uri=f"https://example.invalid/files/batch-{file_number}",
+            mime_type="application/pdf",
+        )
 
     def delete(self, *, name: str) -> None:
         self.deleted.append(name)
@@ -52,10 +62,110 @@ class FakeModels:
         return SimpleNamespace(text=next(self.response_texts))
 
 
+class FakeBatches:
+    def __init__(self, response_sets: list[list[str | Exception]]) -> None:
+        self.response_sets = iter(response_sets)
+        self.calls: list[dict[str, object]] = []
+        self.cancelled: list[str] = []
+
+    def create(
+        self,
+        *,
+        model: str,
+        src: list[genai_types.InlinedRequest],
+        config: dict[str, str],
+    ) -> object:
+        self.calls.append({"model": model, "src": src, "config": config})
+        response_values = next(self.response_sets)
+        if len(response_values) != len(src):
+            raise AssertionError(
+                f"fake has {len(response_values)} responses for {len(src)} requests"
+            )
+        responses = []
+        for value in response_values:
+            if isinstance(value, Exception):
+                responses.append(
+                    genai_types.InlinedResponse(
+                        error=genai_types.JobError(message=str(value))
+                    )
+                )
+            else:
+                responses.append(
+                    genai_types.InlinedResponse(
+                        response=genai_types.GenerateContentResponse(
+                            candidates=[
+                                genai_types.Candidate(
+                                    content=genai_types.Content(
+                                        parts=[genai_types.Part(text=value)]
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                )
+        return SimpleNamespace(
+            name=f"batches/job-{len(self.calls)}",
+            state=SimpleNamespace(name="JOB_STATE_SUCCEEDED"),
+            dest=SimpleNamespace(inlined_responses=responses),
+            error=None,
+        )
+
+    def get(self, *, name: str) -> object:
+        raise AssertionError(f"terminal fake job {name} should not be polled")
+
+    def cancel(self, *, name: str) -> None:
+        self.cancelled.append(name)
+
+
+class PollingFakeBatches:
+    def __init__(self, *, interrupt: bool = False) -> None:
+        self.interrupt = interrupt
+        self.get_calls: list[str] = []
+        self.cancelled: list[str] = []
+
+    def create(self, **_: object) -> object:
+        return SimpleNamespace(
+            name="batches/polling-job",
+            state=SimpleNamespace(name="JOB_STATE_PENDING"),
+            dest=None,
+            error=None,
+        )
+
+    def get(self, *, name: str) -> object:
+        self.get_calls.append(name)
+        if self.interrupt:
+            raise KeyboardInterrupt
+        response = genai_types.InlinedResponse(
+            response=genai_types.GenerateContentResponse(
+                candidates=[
+                    genai_types.Candidate(
+                        content=genai_types.Content(
+                            parts=[genai_types.Part(text="done")]
+                        )
+                    )
+                ]
+            )
+        )
+        return SimpleNamespace(
+            name=name,
+            state=SimpleNamespace(name="JOB_STATE_SUCCEEDED"),
+            dest=SimpleNamespace(inlined_responses=[response]),
+            error=None,
+        )
+
+    def cancel(self, *, name: str) -> None:
+        self.cancelled.append(name)
+
+
 class FakeClient:
-    def __init__(self, response_texts: list[str]) -> None:
+    def __init__(
+        self,
+        response_texts: list[str],
+        batch_response_sets: list[list[str | Exception]] | None = None,
+    ) -> None:
         self.files = FakeFiles()
         self.models = FakeModels(response_texts)
+        self.batches = FakeBatches(batch_response_sets or [])
 
 
 class BuildPageBatchesTests(unittest.TestCase):
@@ -263,6 +373,170 @@ class ValidateBatchTests(unittest.TestCase):
         )
 
 
+class AsyncBatchApiTests(unittest.TestCase):
+    def test_polls_until_batch_job_finishes(self) -> None:
+        client = FakeClient([])
+        client.batches = PollingFakeBatches()
+        request = genai_types.InlinedRequest(contents="test")
+
+        with patch("content_pipeline.gemini_md.time.sleep") as sleep:
+            responses = _run_batch_api_job(
+                client,
+                "test-model",
+                [request],
+                "test-job",
+            )
+
+        self.assertEqual(responses[0].response.text, "done")
+        sleep.assert_called_once_with(BATCH_POLL_INTERVAL)
+        self.assertEqual(
+            client.batches.get_calls,
+            ["batches/polling-job"],
+        )
+
+    def test_keyboard_interrupt_cancels_active_remote_job(self) -> None:
+        client = FakeClient([])
+        client.batches = PollingFakeBatches(interrupt=True)
+        request = genai_types.InlinedRequest(contents="test")
+
+        with (
+            patch("content_pipeline.gemini_md.time.sleep"),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            _run_batch_api_job(
+                client,
+                "test-model",
+                [request],
+                "test-job",
+            )
+
+        self.assertEqual(
+            client.batches.cancelled,
+            ["batches/polling-job"],
+        )
+
+    def test_batches_conversion_and_validation_and_retries_only_failures(
+        self,
+    ) -> None:
+        first_page = "<!-- source-page: 1 -->\nपहला प्रारूप"
+        second_page = "<!-- source-page: 2 -->\nदूसरा प्रारूप"
+        corrected_first_page = "<!-- source-page: 1 -->\nसुधारा हुआ प्रारूप"
+        client = FakeClient(
+            [],
+            [
+                [first_page, second_page],
+                [
+                    "1. Page 1 is missing a heading.",
+                    "PASS",
+                    "PASS",
+                    "PASS",
+                    "PASS",
+                    "PASS",
+                ],
+                [corrected_first_page],
+                ["PASS", "PASS", "PASS"],
+            ],
+        )
+
+        with patch("content_pipeline.gemini_md.time.sleep") as sleep:
+            results = convert_batches_with_batch_api(
+                client,
+                [make_batch(1), make_batch(2)],
+                "test-model",
+                "hindi",
+            )
+
+        self.assertEqual(results, [corrected_first_page, second_page])
+        self.assertEqual(client.models.calls, [])
+        self.assertEqual(
+            [len(call["src"]) for call in client.batches.calls],
+            [2, 6, 1, 3],
+        )
+        sleep.assert_called_once_with(10)
+        retry_request = client.batches.calls[2]["src"][0]
+        self.assertEqual(retry_request.metadata["batch_index"], "0")
+        self.assertIn(
+            "Page 1 is missing a heading.",
+            retry_request.contents[2],
+        )
+        self.assertEqual(
+            client.files.deleted,
+            ["files/batch-1", "files/batch-2"],
+        )
+
+    def test_batch_request_error_retries_without_retrying_successes(self) -> None:
+        first_page = "<!-- source-page: 1 -->\nपहला प्रारूप"
+        second_page = "<!-- source-page: 2 -->\nदूसरा प्रारूप"
+        client = FakeClient(
+            [],
+            [
+                [RuntimeError("temporary capacity error"), second_page],
+                ["PASS", "PASS", "PASS"],
+                [first_page],
+                ["PASS", "PASS", "PASS"],
+            ],
+        )
+
+        with patch("content_pipeline.gemini_md.time.sleep"):
+            results = convert_batches_with_batch_api(
+                client,
+                [make_batch(1), make_batch(2)],
+                "test-model",
+                "hindi",
+            )
+
+        self.assertEqual(results, [first_page, second_page])
+        self.assertEqual(
+            [len(call["src"]) for call in client.batches.calls],
+            [2, 3, 1, 3],
+        )
+
+    def test_convert_pdf_defaults_to_batch_api_and_sync_overrides_it(self) -> None:
+        markdown = "<!-- source-page: 1 -->\n[रिक्त पृष्ठ]"
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp_dir = Path(tmp_name)
+            input_file = tmp_dir / "book.pdf"
+            output_dir = tmp_dir / "out"
+            writer = pypdf.PdfWriter()
+            writer.add_blank_page(width=100, height=100)
+            with input_file.open("wb") as file:
+                writer.write(file)
+
+            async_client = FakeClient(
+                [],
+                [[markdown], ["PASS", "PASS", "PASS"]],
+            )
+            with redirect_stdout(io.StringIO()):
+                async_output = convert_pdf(
+                    input_file,
+                    output_dir,
+                    async_client,
+                    "hindi",
+                    batch_size=1,
+                )
+
+            self.assertEqual(async_output.read_text(encoding="utf-8"), markdown)
+            self.assertEqual(async_client.models.calls, [])
+            self.assertEqual(len(async_client.batches.calls), 2)
+
+            sync_client = FakeClient(
+                [markdown, "PASS", "PASS", "PASS"],
+            )
+            with redirect_stdout(io.StringIO()):
+                sync_output = convert_pdf(
+                    input_file,
+                    output_dir,
+                    sync_client,
+                    "hindi",
+                    batch_size=1,
+                    sync=True,
+                )
+
+            self.assertEqual(sync_output.read_text(encoding="utf-8"), markdown)
+            self.assertEqual(len(sync_client.models.calls), 4)
+            self.assertEqual(sync_client.batches.calls, [])
+
+
 class PageValidationTests(unittest.TestCase):
     def test_reports_foreign_text_on_the_exact_marked_page(self) -> None:
         batch = make_batch(40, 41)
@@ -331,6 +605,19 @@ class PageValidationTests(unittest.TestCase):
         )
         self.assertEqual(args.language, "hindi")
         self.assertEqual(args.batch_size, 6)
+        self.assertFalse(args.sync)
+
+        sync_args = parse_args(
+            [
+                "--language",
+                "Hindi",
+                "--sync",
+                "--output-dir",
+                "out",
+                "book.pdf",
+            ]
+        )
+        self.assertTrue(sync_args.sync)
 
         with (
             patch("sys.stderr"),
