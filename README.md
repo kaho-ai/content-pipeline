@@ -56,7 +56,7 @@ uv run gemini-md --output-dir markdown --pages 3-15 path/to/document.pdf
 
 Generated Markdown files are written as `<output-dir>/<pdf-name>.md`. When `--pages` is used, only the selected page or page range is converted. The selected pages are combined into a single Markdown output file rather than being written as separate per-page files.
 
-For full-document conversion, large PDFs are processed internally in chunks according to `--chunk-size` (default: `20` pages). The resulting chunks are combined into one Markdown file per input PDF.
+For full-document conversion, large PDFs are processed internally in chunks according to `--chunk-size` (default: `10` pages). The resulting chunks are combined into one Markdown file per input PDF.
 
 ## Validate PDF to Markdown
 
@@ -111,7 +111,7 @@ Options:
 | Flag | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-o, --output-dir OUTPUT_DIR` | Yes | None | Directory where Markdown files will be written. The directory is created if it does not exist. |
-| `--chunk-size CHUNK_SIZE` | No | `20` | Pages per Gemini request for large PDFs. Must be greater than zero. PDFs with at most this many pages are converted in a single request. |
+| `--chunk-size CHUNK_SIZE` | No | `10` | Pages per Gemini request for large PDFs. Must be greater than zero. PDFs with at most this many pages are converted in a single request. |
 | `--pages PAGES` | No | None | Convert a specific page or page range (for example, `3` or `3-15`) instead of the entire PDF. When multiple PDFs are provided, the same page selection is applied to each input. |
 | `--model MODEL` | No | `gemini-3.5-flash-lite` | Gemini model used for conversion. |
 | `-h, --help` | No | None | Show command help and exit. |
