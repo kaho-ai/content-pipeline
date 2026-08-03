@@ -63,7 +63,12 @@ class FakeModels:
 
 
 class FakeBatches:
-    def __init__(self, response_sets: list[list[str | Exception]]) -> None:
+    def __init__(
+        self,
+        response_sets: list[
+            list[str | Exception | genai_types.GenerateContentResponse]
+        ],
+    ) -> None:
         self.response_sets = iter(response_sets)
         self.calls: list[dict[str, object]] = []
         self.cancelled: list[str] = []
@@ -88,6 +93,10 @@ class FakeBatches:
                     genai_types.InlinedResponse(
                         error=genai_types.JobError(message=str(value))
                     )
+                )
+            elif isinstance(value, genai_types.GenerateContentResponse):
+                responses.append(
+                    genai_types.InlinedResponse(response=value)
                 )
             else:
                 responses.append(
@@ -161,7 +170,10 @@ class FakeClient:
     def __init__(
         self,
         response_texts: list[str],
-        batch_response_sets: list[list[str | Exception]] | None = None,
+        batch_response_sets: list[
+            list[str | Exception | genai_types.GenerateContentResponse]
+        ]
+        | None = None,
     ) -> None:
         self.files = FakeFiles()
         self.models = FakeModels(response_texts)
@@ -490,6 +502,40 @@ class AsyncBatchApiTests(unittest.TestCase):
             [len(call["src"]) for call in client.batches.calls],
             [2, 3, 1, 3],
         )
+
+    def test_prohibited_content_retry_explains_public_domain_context(self) -> None:
+        prohibited_response = genai_types.GenerateContentResponse(
+            candidates=[
+                genai_types.Candidate(
+                    finish_reason=genai_types.FinishReason.PROHIBITED_CONTENT
+                )
+            ]
+        )
+        markdown = "<!-- source-page: 21 -->\nसाधारण हिन्दी पाठ"
+        client = FakeClient(
+            [],
+            [
+                [prohibited_response],
+                [markdown],
+                ["PASS", "PASS", "PASS"],
+            ],
+        )
+
+        with patch("content_pipeline.gemini_md.time.sleep"):
+            results = convert_batches_with_batch_api(
+                client,
+                [make_batch(21)],
+                "test-model",
+                "hindi",
+            )
+
+        self.assertEqual(results, [markdown])
+        retry_request = client.batches.calls[1]["src"][0]
+        retry_feedback = retry_request.contents[2]
+        self.assertIn("PROHIBITED_CONTENT", retry_feedback)
+        self.assertIn("public-domain literary text", retry_feedback)
+        self.assertIn("flagged incorrectly", retry_feedback)
+        self.assertIn("archival purposes", retry_feedback)
 
     def test_convert_pdf_defaults_to_batch_api_and_sync_overrides_it(self) -> None:
         markdown = "<!-- source-page: 1 -->\n[रिक्त पृष्ठ]"

@@ -77,6 +77,12 @@ PDFs are processed as ordered batches of explicit source pages according to `--b
 
 Gemini must emit a `<!-- source-page: N -->` marker for every page in a batch. Those boundaries let validation and progress output identify the exact original PDF page. Each batch is checked for complete ordered page markers and Unicode script consistency with the required `--language`, then by three focused Gemini validators covering completeness and ordering, transcription fidelity, and Markdown structure. Punctuation, numbers, symbols, and whitespace are allowed regardless of script; every letter and combining mark must use the declared language's script. Every ordinary foreign-script text occurrence is printed as a concise, non-failing `WARNING [FOREIGN_LANGUAGE_TEXT][page N] 'text'` review item. Foreign-script text inside a URL is printed as a non-failing `WARNING [FOREIGN_LANGUAGE_URL][page N] 'url'` review item. These warnings do not retry the batch; other validation failures retry it with combined feedback, using the same five-attempt retry limit as other conversion failures.
 
+If Gemini returns `PROHIBITED_CONTENT` without text, the retry feedback states
+that the input is public-domain literary text being converted faithfully for
+archival purposes and was flagged incorrectly. The reported finish reason is
+preserved in terminal output instead of being reduced to a generic empty-response
+message.
+
 ## Validate PDF to Markdown
 
 Use `validate-count` to compare the word count of a source PDF with its converted Markdown file. This provides a quick way to identify potentially missing content after conversion.
