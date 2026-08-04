@@ -360,6 +360,12 @@ def validate_page_markers(
     ]
 
 
+def _strip_source_page_markers(markdown_text: str) -> str:
+    """Remove internal page-boundary markers from final Markdown output."""
+    stripped = PAGE_MARKER_PATTERN.sub("", markdown_text)
+    return stripped.removeprefix("\n")
+
+
 def validate_language(
     markdown_text: str,
     language: str,
@@ -1357,7 +1363,7 @@ def convert_pdf(
                 normalized_language,
             )
 
-        md_text = "\n\n".join(markdown_batches)
+        md_text = _strip_source_page_markers("\n\n".join(markdown_batches))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if page_range is None:

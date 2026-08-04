@@ -107,6 +107,40 @@ class ConvertPageRangeTests(unittest.TestCase):
                 "batch 1\n\nbatch 2",
             )
 
+    def test_removes_internal_source_page_markers_from_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp_dir = Path(tmp_name)
+            input_file = tmp_dir / "book.pdf"
+            output_dir = tmp_dir / "output"
+            writer = pypdf.PdfWriter()
+            writer.add_blank_page(width=100, height=100)
+            writer.add_blank_page(width=100, height=100)
+            with input_file.open("wb") as file:
+                writer.write(file)
+
+            with patch(
+                "content_pipeline.gemini_md.convert_batches_with_batch_api",
+                return_value=[
+                    "<!-- source-page: 1 -->\nपहला पृष्ठ\n"
+                    "<!-- source-page: 2 -->\nदूसरा पृष्ठ"
+                ],
+            ):
+                output_file = convert_pdf(
+                    input_file,
+                    output_dir,
+                    client=object(),
+                    language="hindi",
+                )
+
+            self.assertEqual(
+                output_file.read_text(encoding="utf-8"),
+                "पहला पृष्ठ\n\nदूसरा पृष्ठ",
+            )
+            self.assertNotIn(
+                "source-page",
+                output_file.read_text(encoding="utf-8"),
+            )
+
     def test_rejects_range_past_end_of_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_name:
             tmp_dir = Path(tmp_name)

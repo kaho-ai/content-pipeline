@@ -627,7 +627,10 @@ class AsyncBatchApiTests(unittest.TestCase):
                     batch_size=1,
                 )
 
-            self.assertEqual(async_output.read_text(encoding="utf-8"), markdown)
+            self.assertEqual(
+                async_output.read_text(encoding="utf-8"),
+                "[रिक्त पृष्ठ]",
+            )
             self.assertEqual(async_client.models.calls, [])
             self.assertEqual(len(async_client.batches.calls), 2)
 
@@ -644,7 +647,10 @@ class AsyncBatchApiTests(unittest.TestCase):
                     sync=True,
                 )
 
-            self.assertEqual(sync_output.read_text(encoding="utf-8"), markdown)
+            self.assertEqual(
+                sync_output.read_text(encoding="utf-8"),
+                "[रिक्त पृष्ठ]",
+            )
             self.assertEqual(len(sync_client.models.calls), 4)
             self.assertEqual(sync_client.batches.calls, [])
 
