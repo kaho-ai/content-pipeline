@@ -14,6 +14,7 @@ dependencies = [
 [project.scripts]
 gemini-md = "content_pipeline.gemini_md:main"
 validate-count = "content_pipeline.validate_count:main"
+spot-errors = "content_pipeline.spot_errors:main" 
 
 [build-system]
 requires = ["hatchling"]

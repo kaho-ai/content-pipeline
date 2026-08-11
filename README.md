@@ -60,10 +60,16 @@ For full-document conversion, large PDFs are processed internally in chunks acco
 
 ## Validate PDF to Markdown
 
-Use `validate-count` to compare the word count of a source PDF with its converted Markdown file. This provides a quick way to identify potentially missing content after conversion.
+Use `validate-count` to compare the word count of a source PDF with its converted Markdown file. The tool provides a quick way to identify potentially missing content after conversion.
 
 ```bash
 uv run validate-count path/to/document.pdf path/to/document.md
+```
+
+Optionally set a coverage threshold (default: 95%). If the Markdown’s word count falls below this percentage of the PDF’s word count, the status will be **REVIEW**.
+
+```bash
+uv run validate-count path/to/document.pdf path/to/document.md --threshold=90
 ```
 
 Example:
@@ -75,22 +81,43 @@ uv run validate-count "C:\Users\user\Downloads\document.pdf" "output\document.md
 Example output:
 
 ```text
-PDF words:      48,214
-Markdown words: 45,640
-Difference:     -2,574
-Coverage:       94.66%
+PDF words:       48,214
+Markdown words:  45,640
+Missing words:   2,574
+Coverage:        94.66%
+Threshold:       95%
+Status:          REVIEW
 ```
 
 The output shows:
 
-- **PDF words** — Number of words extracted from the PDF text layer.
-- **Markdown words** — Number of words in the converted Markdown file.
-- **Difference** — Difference between the Markdown and PDF word counts.
-- **Coverage** — Markdown word count as a percentage of the PDF word count.
+- **PDF words** – Words extracted from the PDF text layer, counted using a Unicode‑aware word splitter (works for Hindi, English, and mixed scripts).
+- **Markdown words** – Words in the converted Markdown file, counted identically.
+- **Missing words** – PDF words minus Markdown words.
+- **Coverage** – Markdown word count as a percentage of the PDF word count.
+- **Threshold** – User‑configured minimum coverage (default 95%).
+- **Status** – `PASS` if coverage ≥ threshold; `REVIEW` otherwise.
 
-A lower Markdown word count does not necessarily mean content is missing. Differences may result from removed page numbers, headers, footers, OCR artifacts, repeated text, or normalization during conversion. The coverage value should therefore be used as a preliminary validation signal. Unusually low coverage may indicate that the converted Markdown requires manual inspection.
+A lower Markdown word count does **not** necessarily mean content is missing. Differences may result from removed page numbers, headers, footers, OCR artifacts, or normalisation during conversion. The coverage percentage gives a preliminary signal – when it drops below your threshold, manual inspection is recommended.
 
-> **Note:** PDF word counting depends on the PDF having an extractable text or OCR layer. Image-only scanned PDFs may require OCR before a meaningful comparison can be made.
+> **Note:** PDF word counting depends on the PDF having an extractable text or OCR layer. If the PDF is an image‑only scan, `validate-count` will warn that no text layer is present and exit. Run OCR on the file first before using this validation.
+
+## Spot OCR/Conversion Errors (Non‑destructive)
+
+Use `spot-errors` to insert footnotes at every discrepancy between the original PDF and the converted Markdown, **without modifying the text**. This helps you manually review and correct only what’s actually wrong.
+
+```bash
+uv run spot-errors --md flawed.md --pdf original.pdf --output-dir annotated
+```
+
+It works with multiple pairs:
+
+```bash
+uv run spot-errors --md a.md b.md --pdf a.pdf b.pdf -o annotated
+```
+
+The output is a new Markdown file with added `[^1]`, `[^2]`, … markers and a `## Footnotes` section explaining each error.
+
 
 ## CLI Reference
 
@@ -128,18 +155,50 @@ uv run gemini-md --output-dir markdown --model gemini-3.1-flash-lite-preview doc
 ### `validate-count`
 
 ```bash
-uv run validate-count PDF MARKDOWN
+uv run validate-count PDF MARKDOWN [--threshold PERCENT]
 ```
 
 Arguments:
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `PDF` | Yes | Source PDF file used for the conversion. |
+| `PDF` | Yes | Source PDF file used for conversion. |
 | `MARKDOWN` | Yes | Converted Markdown file to compare against the source PDF. |
 
-Example:
+Options:
+
+| Flag | Required | Default | Description |
+| --- | --- | --- | --- |
+| `--threshold PERCENT` | No | `95` | Minimum coverage percentage for PASS status. If Markdown word count falls below this percentage of PDF words, the status is REVIEW. |
+| `-h, --help` | No | None | Show command help and exit. |
+
+Examples:
 
 ```bash
-uv run validate-count path/to/document.pdf path/to/document.md
+uv run validate-count document.pdf document.md
+uv run validate-count document.pdf document.md --threshold=90
 ```
+
+### `spot-errors`
+
+```bash
+uv run spot-errors --md FLAWED_MD... --pdf ORIGINAL_PDF... --output-dir DIR
+```
+
+Options:
+
+| Flag | Required | Default | Description |
+| --- | --- | --- | --- |
+| `-m, --md FLAWED_MD` | Yes | None | One or more flawed Markdown files (output of `gemini-md`). Repeat for multiple files. |
+| `-p, --pdf ORIGINAL_PDF` | Yes | None | Original PDF files, in the same order and count as `--md`. |
+| `-o, --output-dir DIR` | Yes | None | Directory where annotated Markdown files will be written. |
+| `--api-key API_KEY` | No | `$GEMINI_API_KEY` | Gemini API key. If not given, the environment variable is used. |
+| `-h, --help` | No | None | Show command help and exit. |
+
+Examples:
+
+```bash
+uv run spot-errors --md flawed.md --pdf original.pdf --output-dir reviewed
+uv run spot-errors -m ch1.md ch2.md -p ch1.pdf ch2.pdf -o reviewed
+```
+
